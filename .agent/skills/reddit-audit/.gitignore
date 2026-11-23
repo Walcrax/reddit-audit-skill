@@ -1,0 +1,6 @@
+# Keep local Reddit OAuth credentials and SQLite graph out of git
+.env
+data/*.db
+data/*.db-journal
+data/*.db-wal
+scripts/__pycache__/

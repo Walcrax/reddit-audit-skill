@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials & runtime SQLite databases
+.env
+*.db
+*.db-journal
+*.db-wal
+
+# OS / Editor
+.DS_Store
+Thumbs.db

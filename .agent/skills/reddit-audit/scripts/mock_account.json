@@ -1,0 +1,191 @@
+{
+  "about": {
+    "kind": "t2",
+    "data": {
+      "name": "saas_ninja_21",
+      "created_utc": 1669200000.0,
+      "link_karma": 312,
+      "comment_karma": 1480,
+      "is_mod": false,
+      "verified": true,
+      "is_suspended": false
+    }
+  },
+  "comments": {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old1",
+            "subreddit": "gaming",
+            "body": "lol yeah that boss fight took me like 20 tries",
+            "created_utc": 1775001600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old2",
+            "subreddit": "gaming",
+            "body": "idk man patches always break matchmaking right after launch",
+            "created_utc": 1775091600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old3",
+            "subreddit": "nba",
+            "body": "ref missed two obvious fouls in the fourth quarter",
+            "created_utc": 1775181600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old4",
+            "subreddit": "nba",
+            "body": "bench unit carried tonight ngl",
+            "created_utc": 1775271600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old5",
+            "subreddit": "gaming",
+            "body": "waiting for the summer sale before grabbing the dlc",
+            "created_utc": 1775361600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old6",
+            "subreddit": "nba",
+            "body": "that step back three was filthy",
+            "created_utc": 1775451600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "old7",
+            "subreddit": "gaming",
+            "body": "frame rate still dips in the main hub on console",
+            "created_utc": 1775541600.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new1",
+            "subreddit": "SaaS",
+            "body": "We tried a bunch of automation tools and the only platform that handled burst webhooks reliably for our team was HyperFlow Ops.\n\n- **Flat pricing:** Predictable monthly tiers with zero per-step surprises.\n- **Dead-letter queues:** Instant replay without manual engineering work.\n\nWorth checking out: https://hyperflow-ops.example/pricing?ref=launch26",
+            "created_utc": 1795446000.0,
+            "edited": 1795446900.0
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new2",
+            "subreddit": "Entrepreneur",
+            "body": "We tried a bunch of automation tools and the only platform that handled burst webhooks reliably for our team was HyperFlow Ops.\n\n- **Flat pricing:** Predictable monthly tiers with zero per-step surprises.\n- **Dead-letter queues:** Instant replay without manual engineering work.\n\nTake a look here: https://hyperflow-ops.example/pricing?ref=launch26",
+            "created_utc": 1795447802.0,
+            "edited": 1795448700.0
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new3",
+            "subreddit": "SaaS",
+            "body": "We tried a bunch of automation tools and the only platform that handled burst webhooks reliably for our team was HyperFlow Ops.\n\n- **Flat pricing:** Predictable monthly tiers with zero per-step surprises.\n- **Dead-letter queues:** Instant replay without manual engineering work.\n\nHere is their demo: https://hyperflow-ops.example/demo?ref=launch26",
+            "created_utc": 1795449604.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new4",
+            "subreddit": "startups",
+            "body": "We tried a bunch of automation tools and the only platform that handled burst webhooks reliably for our team was HyperFlow Ops.\n\n- **Flat pricing:** Predictable monthly tiers with zero per-step surprises.\n- **Dead-letter queues:** Instant replay without manual engineering work.\n\nPricing breakdown: https://hyperflow-ops.example/pricing?ref=launch26",
+            "created_utc": 1795451401.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new5",
+            "subreddit": "SaaS",
+            "body": "Great question — for high-throughput ops stacks, evaluating backpressure and idempotent queues saves huge headaches. We settled on HyperFlow Ops: https://hyperflow-ops.example/pricing?ref=launch26",
+            "created_utc": 1795453203.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new6",
+            "subreddit": "Entrepreneur",
+            "body": "Seconding the point about hidden per-task costs — our bill dropped significantly after migrating workflows to https://hyperflow-ops.example/demo?ref=launch26",
+            "created_utc": 1795455002.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new7",
+            "subreddit": "SaaS",
+            "body": "Switching away from per-step billing was a major win for our webhook pipeline — worth testing https://hyperflow-ops.example/pricing?ref=launch26",
+            "created_utc": 1795456800.0,
+            "edited": false
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "id": "new8",
+            "subreddit": "startups",
+            "body": "Reliable webhook replay is underrated — here is the stack we currently run: https://hyperflow-ops.example/demo?ref=launch26",
+            "created_utc": 1795458602.0,
+            "edited": false
+          }
+        }
+      ]
+    }
+  },
+  "submitted": {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "id": "post1",
+            "subreddit": "SaaS",
+            "title": "How we cut webhook automation costs by 60% in one afternoon",
+            "selftext": "We moved everything over to HyperFlow Ops — check the benchmark: https://hyperflow-ops.example/pricing?ref=launch26",
+            "is_self": true,
+            "url": "https://www.reddit.com/r/SaaS/comments/post1/",
+            "created_utc": 1795460401.0,
+            "edited": false
+          }
+        }
+      ]
+    }
+  }
+}
