@@ -4,7 +4,7 @@ A zero-dependency, deterministic **AI Agent Skill & CLI toolkit** that audits Re
 
 ---
 
-## Quick Guide: How to Use
+## How to Use
 
 **1. Install the skill (zero `pip install`, zero API keys)**
 Copy `.agent/skills/reddit-audit/` into:
