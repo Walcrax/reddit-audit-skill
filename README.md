@@ -6,10 +6,15 @@ A zero-dependency, deterministic **AI Agent Skill & CLI toolkit** that audits Re
 
 ## How to Use
 
-**1. Install the skill (zero `pip install`, zero API keys)**
-Copy `.agent/skills/reddit-audit/` into:
-- **Project-local:** `<your-repo>/.agent/skills/reddit-audit/`
-- **Global (all workspaces):** `~/.gemini/config/skills/reddit-audit/`
+**1. Install the skill (works in Antigravity, Claude Code, OpenCode, Codex, Cursor)**
+Copy the `.agent/skills/reddit-audit/` folder into your AI tool's skills directory (zero `pip install`, zero API keys; scripts resolve paths relative to `__file__`):
+
+| AI Tool | Project-Local Path | Global Path |
+| :--- | :--- | :--- |
+| **Antigravity** | `.agent/skills/reddit-audit/` (or `.agents/skills/`) | `~/.gemini/config/skills/reddit-audit/` |
+| **Claude Code** | `.claude/skills/reddit-audit/` | `~/.claude/skills/reddit-audit/` |
+| **OpenCode** | `.opencode/skills/reddit-audit/` (or `.agents/skills/`) | `~/.config/opencode/skills/reddit-audit/` |
+| **Codex / Cursor** | `.agents/skills/reddit-audit/` (or `.cursor/skills/`) | `~/.codex/skills/reddit-audit/` |
 
 *(Requires Python 3.10+ on `PATH`. Uses only the standard library.)*
 

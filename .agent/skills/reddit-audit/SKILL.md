@@ -9,29 +9,31 @@ All data fetching and scoring runs **100% locally via Python standard library sc
 
 ## Workflow
 
+All helper scripts live in `scripts/` beside this `SKILL.md` (referred to below as `<SKILL_DIR>`, e.g. `.agent/skills/reddit-audit`, `.claude/skills/reddit-audit`, `.opencode/skills/reddit-audit`, or `~/.claude/skills/reddit-audit`). Resolve `<SKILL_DIR>` to the directory containing this `SKILL.md` file.
+
 ### 1. Route by Target Type
-- **Reddit thread URL (default):** run the single-thread auditor immediately (no pre-run prompt):
+- **Reddit thread URL (default):** run [audit_thread.py](./scripts/audit_thread.py) immediately (no pre-run prompt):
   ```bash
-  python .agent/skills/reddit-audit/scripts/audit_thread.py "<THREAD_URL>" --max-comments 50 --top 5
+  python "<SKILL_DIR>/scripts/audit_thread.py" "<THREAD_URL>" --max-comments 50 --top 5
   ```
-- **Subreddit (`r/<name>` or subreddit URL):** seed the graph and scan recent threads:
+- **Subreddit (`r/<name>` or subreddit URL):** seed the graph and scan recent threads via [audit_subreddit.py](./scripts/audit_subreddit.py):
   ```bash
-  python .agent/skills/reddit-audit/scripts/audit_subreddit.py "r/<SUBREDDIT>" --sort new --limit 10 --max-comments 30
+  python "<SKILL_DIR>/scripts/audit_subreddit.py" "r/<SUBREDDIT>" --sort new --limit 10 --max-comments 30
   ```
-- **Flagged username (`u/<name>` or profile URL):** run deep confirmation inspection:
+- **Flagged username (`u/<name>` or profile URL):** run deep confirmation inspection via [inspect_account.py](./scripts/inspect_account.py):
   ```bash
-  python .agent/skills/reddit-audit/scripts/inspect_account.py "<USERNAME>"
+  python "<SKILL_DIR>/scripts/inspect_account.py" "<USERNAME>"
   ```
-- **Watchlist management (`confirmed_bot`, `confirmed_swarm`, `confirmed_takeover`, `confirmed_shill`, `suspicious`, `benign`):**
+- **Watchlist management (`confirmed_bot`, `confirmed_swarm`, `confirmed_takeover`, `confirmed_shill`, `suspicious`, `benign`) via [watchlist.py](./scripts/watchlist.py):**
   ```bash
-  python .agent/skills/reddit-audit/scripts/watchlist.py add "<USERNAME>" --verdict confirmed_bot --confidence 90 --notes "Leaked tool_call + cron cadence"
-  python .agent/skills/reddit-audit/scripts/watchlist.py list
-  python .agent/skills/reddit-audit/scripts/watchlist.py remove "<USERNAME>"
+  python "<SKILL_DIR>/scripts/watchlist.py" add "<USERNAME>" --verdict confirmed_bot --confidence 90 --notes "Leaked tool_call + cron cadence"
+  python "<SKILL_DIR>/scripts/watchlist.py" list
+  python "<SKILL_DIR>/scripts/watchlist.py" remove "<USERNAME>"
   ```
 - **Offline verification (`--mock`):**
   ```bash
-  python .agent/skills/reddit-audit/scripts/audit_thread.py --mock scripts/mock_thread.json --top 5
-  python .agent/skills/reddit-audit/scripts/inspect_account.py --mock scripts/mock_account.json
+  python "<SKILL_DIR>/scripts/audit_thread.py" --mock scripts/mock_thread.json --top 5
+  python "<SKILL_DIR>/scripts/inspect_account.py" --mock scripts/mock_account.json
   ```
 
 Useful optional flags: `--source auto|reddit|arctic-shift`, `--file <saved_thread.json>`, `--format json|md`, `--min-age-hours 6` (on `audit_subreddit.py`), `--no-profile-fetch`, `--no-oauth`, `--ignore-users "bot1,bot2"`, `--window-sec 300`, `--db "<path>"`.
