@@ -385,6 +385,112 @@ class TestRedditAuditSkill(unittest.TestCase):
             self.assertIn("loyal_reg", out_s["power_users_flagged"])
             self.assertIn("shill_1", out_s["recommended_deep_checks"])
 
+    def test_cross_account_near_duplicate_shingling_and_quote_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "shingle.db"
+
+            # Thread 1 at T0: slow-drip linkless pitch + human quoting OP
+            t0 = 1795400000.0
+            quoted_block = (
+                "> Over the past month we migrated our entire ops stack across twelve "
+                "automation platforms to measure cold start latency and webhook retries under load."
+            )
+            th1 = make_thread(
+                "sh_t1", "SaaS", "op_one", t0,
+                [
+                    cnode(
+                        "d1", "sh_t1", "t3_sh_t1", "drip_bot_alpha",
+                        "We switched our internal team over to AcmeFlow last quarter after getting "
+                        "burned by unpredictable per step webhook billing and silent retry storms "
+                        "and honestly our engineering ops spend dropped in half overnight.",
+                        t0 + 600,
+                    ),
+                    cnode(
+                        "q1", "sh_t1", "t3_sh_t1", "human_reader_1",
+                        f"{quoted_block}\n\nYeah totally agree, cold starts are rough.",
+                        t0 + 900,
+                    ),
+                    cnode(
+                        "s1", "sh_t1", "t3_sh_t1", "human_short_1",
+                        "Thanks for sharing this, super helpful!",
+                        t0 + 1200,
+                    ),
+                ],
+            )
+            p1 = tmp_path / "sh_t1.json"
+            p1.write_text(json.dumps(th1), encoding="utf-8")
+            rc1, out1, _ = run_cli(AUDIT_THREAD, "--mock", str(p1), "--db", str(db))
+            self.assertEqual(rc1, 0)
+            self.assertGreaterEqual(out1["db_stats"]["indexed_shingles"], 1)
+
+            # Thread 2 SIX HOURS LATER (21,600s >> 300s window), NO links, slightly paraphrased copycat
+            t2 = t0 + 21600.0
+            th2 = make_thread(
+                "sh_t2", "Entrepreneur", "op_two", t2,
+                [
+                    cnode(
+                        "d2", "sh_t2", "t3_sh_t2", "drip_bot_beta",
+                        "We switched our internal team over to AcmeFlow last month after getting "
+                        "burned by unpredictable per step webhook billing and silent retry storms "
+                        "and honestly our engineering ops spend dropped in half almost overnight.",
+                        t2 + 700,
+                    ),
+                    cnode(
+                        "q2", "sh_t2", "t3_sh_t2", "human_reader_2",
+                        f"{quoted_block}\n\nInteresting benchmark, did you test dead letter queues?",
+                        t2 + 1000,
+                    ),
+                    cnode(
+                        "s2", "sh_t2", "t3_sh_t2", "human_short_2",
+                        "Thanks for sharing this, super helpful!",
+                        t2 + 1300,
+                    ),
+                ],
+            )
+            p2 = tmp_path / "sh_t2.json"
+            p2.write_text(json.dumps(th2), encoding="utf-8")
+            rc2, out2, b2 = run_cli(AUDIT_THREAD, "--mock", str(p2), "--db", str(db))
+            self.assertEqual(rc2, 0)
+            self.assertLessEqual(b2, 7800)
+
+            # drip_bot_beta must be flagged across threads (6h apart, zero links!)
+            flagged_authors = {a["author"]: a for a in out2["top_anomalies"]}
+            self.assertIn("drip_bot_beta", flagged_authors)
+            self.assertNotIn("human_reader_2", flagged_authors)
+            self.assertNotIn("human_short_2", flagged_authors)
+
+            beta = flagged_authors["drip_bot_beta"]
+            self.assertGreaterEqual(beta["sub_scores"]["class2_swarm"], 54)
+            self.assertTrue(
+                "cross_account_copycat_shingle" in beta["flags"]
+                or "cross_account_near_duplicate" in beta["flags"],
+                beta["flags"],
+            )
+            self.assertIn("cross_thread_shingle_match", beta["flags"])
+            self.assertTrue(len(out2["audit_meta"]["near_duplicate_links"]) >= 1)
+            self.assertTrue(
+                any(
+                    set(cl["authors"]) == {"drip_bot_alpha", "drip_bot_beta"}
+                    for cl in out2["graph_clusters"]
+                ),
+                out2["graph_clusters"],
+            )
+
+            # Deep account inspection on drip_bot_beta must surface cross_account_duplicate_peers
+            acct_bundle = {
+                "about": {"kind": "t2", "data": {"name": "drip_bot_beta", "created_utc": t0 - 86400 * 90}},
+                "comments": {"kind": "Listing", "data": {"children": []}},
+                "submitted": {"kind": "Listing", "data": {"children": []}},
+            }
+            acct_file = tmp_path / "drip_beta_acct.json"
+            acct_file.write_text(json.dumps(acct_bundle), encoding="utf-8")
+            rc_a, out_a, _ = run_cli(INSPECT_ACCOUNT, "--mock", str(acct_file), "--db", str(db))
+            self.assertEqual(rc_a, 0)
+            self.assertIn("cross_account_near_duplicate", out_a["flags"])
+            peers = [p["peer"] for p in out_a["graph_context"]["cross_account_duplicate_peers"]]
+            self.assertIn("drip_bot_alpha", peers)
+
 
 if __name__ == "__main__":
     unittest.main()

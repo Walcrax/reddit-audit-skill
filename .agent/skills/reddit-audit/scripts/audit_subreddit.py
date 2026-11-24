@@ -233,6 +233,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     all_role_patterns: dict[str, dict[str, Any]] = {}
     all_watchlist_hits: dict[str, dict[str, Any]] = {}
     all_watchlist_assoc: list[dict[str, Any]] = []
+    all_near_dups: dict[tuple[str, str], dict[str, Any]] = {}
 
     try:
         for label, payload in thread_payloads:
@@ -306,6 +307,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             for wh in meta.get("watchlist_hits", []):
                 all_watchlist_hits[wh["author"]] = wh
             all_watchlist_assoc.extend(meta.get("watchlist_associations", []))
+            for nd in meta.get("near_duplicate_links", []):
+                nd_key = (nd["author_a"], nd["author_b"])
+                if nd_key not in all_near_dups or nd["similarity"] > all_near_dups[nd_key]["similarity"]:
+                    all_near_dups[nd_key] = nd
 
         db_stats = db.get_db_stats(subreddit_name)
     finally:
@@ -351,6 +356,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "power_users_flagged": sorted(all_power_users),
         "watchlist_hits": list(all_watchlist_hits.values()),
         "watchlist_associations": all_watchlist_assoc[:8],
+        "near_duplicate_links": sorted(
+            all_near_dups.values(), key=lambda x: (-x["similarity"], -x["match_count"])
+        )[:8],
         "warnings": warnings[:10],
     }
 

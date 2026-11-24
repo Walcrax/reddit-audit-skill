@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -130,6 +131,13 @@ WATCHLIST_VALID_VERDICTS = WATCHLIST_BAD_VERDICTS | {"benign"}
 RE_SENTENCE_SPLIT = re.compile(r"[.!?\n]+")
 RE_WORD_TOKEN = re.compile(r"[A-Za-z0-9']+")
 RE_MD_STRUCT = re.compile(r"(?m)(?:^\s*(?:[-*+]|\d+\.)\s+\S|\*\*[^*\n]{2,60}\*\*|^#{1,4}\s+\S)")
+RE_QUOTE_LINE = re.compile(r"(?m)^\s*>.*$")
+
+SHINGLE_K = 24
+SHINGLE_MIN_NGRAMS = 8
+SHINGLE_MIN_SIMILARITY = 0.50
+SHINGLE_MIN_SHARED = 6
+SHINGLE_BAND_SALTS = (0x9E3779B1, 0x85EBCA77, 0xC2B2AE3D, 0x27D4EB2F)
 
 # ---------------------------------------------------------------------------
 # Compiled Heuristic Regexes (Class 3)
@@ -433,6 +441,68 @@ def aggregate_stylometry(texts: list[str]) -> dict[str, float]:
         "markdown_rate": round(sum(m["has_markdown"] for m in metrics) / n, 3),
         "em_dash_per_1k": round(sum(m["em_dash_per_1k"] for m in metrics) / n, 2),
     }
+
+
+def _mix32(val: int, salt: int) -> int:
+    """Deterministic 32-bit integer hash mixer for independent MinHash LSH bands."""
+    x = (val ^ salt) & 0xFFFFFFFF
+    x = (((x >> 16) ^ x) * 0x45D9F3B) & 0xFFFFFFFF
+    x = (((x >> 16) ^ x) * 0x45D9F3B) & 0xFFFFFFFF
+    return ((x >> 16) ^ x) & 0xFFFFFFFF
+
+
+def compute_shingle_fingerprint(text: str) -> Optional[dict[str, Any]]:
+    """Build a compact bottom-k word 3-gram sketch + 4-band MinHash LSH signature.
+
+    Strips Reddit blockquote lines (`> ...`) and URLs first to prevent false positives
+    when different humans quote the same OP passage or link the same resource.
+    """
+    cleaned = html.unescape(text or "")
+    cleaned = RE_QUOTE_LINE.sub(" ", cleaned)
+    cleaned = RE_URL.sub(" ", cleaned)
+    words = [w.lower() for w in RE_WORD_TOKEN.findall(cleaned) if len(w) >= 2]
+    if len(words) < SHINGLE_MIN_NGRAMS + 2:
+        return None
+
+    ngrams = {f"{words[i]} {words[i + 1]} {words[i + 2]}" for i in range(len(words) - 2)}
+    if len(ngrams) < SHINGLE_MIN_NGRAMS:
+        return None
+
+    hashes = sorted({zlib.crc32(ng.encode("utf-8")) & 0xFFFFFFFF for ng in ngrams})
+    if len(hashes) < SHINGLE_MIN_NGRAMS:
+        return None
+
+    sketch = hashes[:SHINGLE_K]
+    bands = [
+        f"{min(_mix32(h, salt) for h in hashes):08x}"
+        for salt in SHINGLE_BAND_SALTS
+    ]
+    return {
+        "shingle_count": len(hashes),
+        "sketch": sketch,
+        "bands": bands,
+    }
+
+
+def estimate_sketch_jaccard(
+    sketch_a: list[int], count_a: int, sketch_b: list[int], count_b: int
+) -> tuple[float, int]:
+    """Estimate Jaccard similarity and shared shingle count from bottom-k sketches."""
+    if not sketch_a or not sketch_b:
+        return 0.0, 0
+    set_a = set(sketch_a)
+    set_b = set(sketch_b)
+    if count_a <= SHINGLE_K and count_b <= SHINGLE_K:
+        shared = len(set_a & set_b)
+        union_len = len(set_a | set_b)
+        return (round(shared / union_len, 3) if union_len else 0.0), shared
+
+    union_k = sorted(set_a | set_b)[:SHINGLE_K]
+    if not union_k:
+        return 0.0, 0
+    shared_k = sum(1 for h in union_k if h in set_a and h in set_b)
+    raw_shared = len(set_a & set_b)
+    return round(shared_k / len(union_k), 3), max(shared_k, raw_shared)
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1328,20 @@ class RedditGraphDB:
                 updated_utc REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS comment_shingles (
+                comment_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                subreddit TEXT NOT NULL,
+                created_utc REAL NOT NULL,
+                shingle_count INTEGER NOT NULL,
+                sketch_json TEXT NOT NULL,
+                band_0 TEXT NOT NULL,
+                band_1 TEXT NOT NULL,
+                band_2 TEXT NOT NULL,
+                band_3 TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_threads_subreddit ON threads(subreddit);
             CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
             CREATE INDEX IF NOT EXISTS idx_comments_author ON comments(author);
@@ -1265,6 +1349,11 @@ class RedditGraphDB:
             CREATE INDEX IF NOT EXISTS idx_co_occ_pair ON co_occurrences(author_a, author_b);
             CREATE INDEX IF NOT EXISTS idx_co_occ_thread ON co_occurrences(thread_id);
             CREATE INDEX IF NOT EXISTS idx_watchlist_verdict ON watchlist(verdict);
+            CREATE INDEX IF NOT EXISTS idx_shingles_band0 ON comment_shingles(band_0);
+            CREATE INDEX IF NOT EXISTS idx_shingles_band1 ON comment_shingles(band_1);
+            CREATE INDEX IF NOT EXISTS idx_shingles_band2 ON comment_shingles(band_2);
+            CREATE INDEX IF NOT EXISTS idx_shingles_band3 ON comment_shingles(band_3);
+            CREATE INDEX IF NOT EXISTS idx_shingles_author ON comment_shingles(author);
             """
         )
         # Forward-compatible column migrations for existing DBs
@@ -1374,6 +1463,196 @@ class RedditGraphDB:
             rows,
         )
         self.conn.commit()
+
+    def upsert_comment_shingles(self, items: list[dict[str, Any]]) -> None:
+        """Persist 4-band LSH shingle sketches for comments and eligible OP posts."""
+        rows = []
+        for it in items:
+            fp = it.get("shingle_fp")
+            if not fp:
+                continue
+            bands = fp["bands"]
+            rows.append(
+                (
+                    it["item_id"],
+                    it["thread_id"],
+                    it["author"],
+                    it["subreddit"],
+                    float(it["created_utc"]),
+                    int(fp["shingle_count"]),
+                    json.dumps(fp["sketch"], separators=(",", ":")),
+                    bands[0],
+                    bands[1],
+                    bands[2],
+                    bands[3],
+                )
+            )
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO comment_shingles (
+                comment_id, thread_id, author, subreddit, created_utc,
+                shingle_count, sketch_json, band_0, band_1, band_2, band_3
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(comment_id) DO UPDATE SET
+                author = excluded.author,
+                created_utc = excluded.created_utc,
+                shingle_count = excluded.shingle_count,
+                sketch_json = excluded.sketch_json,
+                band_0 = excluded.band_0,
+                band_1 = excluded.band_1,
+                band_2 = excluded.band_2,
+                band_3 = excluded.band_3
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def query_cross_account_shingle_matches(
+        self,
+        items: list[dict[str, Any]],
+        min_similarity: float = SHINGLE_MIN_SIMILARITY,
+        min_shared: int = SHINGLE_MIN_SHARED,
+    ) -> list[dict[str, Any]]:
+        """Find cross-account near-duplicate matches across all stored threads via 4-band LSH."""
+        pair_agg: dict[tuple[str, str], dict[str, Any]] = {}
+        seen_item_pairs: set[tuple[str, str]] = set()
+
+        for it in items:
+            fp = it.get("shingle_fp")
+            if not fp:
+                continue
+            author = it["author"]
+            item_id = it["item_id"]
+            thread_id = it["thread_id"]
+            created_utc = float(it["created_utc"])
+            bands = fp["bands"]
+            sketch_a = fp["sketch"]
+            count_a = int(fp["shingle_count"])
+
+            rows = self.conn.execute(
+                """
+                SELECT comment_id, thread_id, author, subreddit, created_utc,
+                       shingle_count, sketch_json
+                FROM comment_shingles
+                WHERE LOWER(author) != LOWER(?)
+                  AND comment_id != ?
+                  AND (band_0 = ? OR band_1 = ? OR band_2 = ? OR band_3 = ?)
+                LIMIT 60
+                """,
+                (author, item_id, bands[0], bands[1], bands[2], bands[3]),
+            ).fetchall()
+
+            for r in rows:
+                other_id = r["comment_id"]
+                item_pair_key = tuple(sorted((item_id, other_id)))
+                if item_pair_key in seen_item_pairs:
+                    continue
+                other_author = r["author"]
+                if other_author.lower() in DEFAULT_IGNORED_AUTHORS:
+                    continue
+                try:
+                    sketch_b = json.loads(r["sketch_json"])
+                except (ValueError, TypeError):
+                    continue
+                sim, shared = estimate_sketch_jaccard(
+                    sketch_a, count_a, sketch_b, int(r["shingle_count"])
+                )
+                if sim < min_similarity or shared < min_shared:
+                    continue
+
+                seen_item_pairs.add(item_pair_key)
+                a, b = sorted((author, other_author))
+                delta = round(abs(created_utc - float(r["created_utc"])), 2)
+                is_cross_thread = thread_id != r["thread_id"]
+                pair_key = (a, b)
+                if pair_key not in pair_agg:
+                    pair_agg[pair_key] = {
+                        "author_a": a,
+                        "author_b": b,
+                        "max_similarity": sim,
+                        "match_count": 1,
+                        "threads": {thread_id, r["thread_id"]},
+                        "cross_thread": is_cross_thread,
+                        "min_delta_sec": delta,
+                        "sample_matched_thread": r["thread_id"],
+                    }
+                else:
+                    ex = pair_agg[pair_key]
+                    ex["max_similarity"] = max(ex["max_similarity"], sim)
+                    ex["match_count"] += 1
+                    ex["threads"].update({thread_id, r["thread_id"]})
+                    ex["cross_thread"] = bool(ex["cross_thread"] or is_cross_thread)
+                    ex["min_delta_sec"] = min(ex["min_delta_sec"], delta)
+
+        results = [
+            {
+                "author_a": v["author_a"],
+                "author_b": v["author_b"],
+                "max_similarity": v["max_similarity"],
+                "match_count": v["match_count"],
+                "distinct_threads": len(v["threads"]),
+                "cross_thread": v["cross_thread"],
+                "min_delta_sec": v["min_delta_sec"],
+                "sample_matched_thread": v["sample_matched_thread"],
+            }
+            for v in pair_agg.values()
+        ]
+        results.sort(key=lambda x: (-x["max_similarity"], -x["match_count"], x["author_a"]))
+        return results
+
+    def query_author_shingle_peers(self, author: str) -> list[dict[str, Any]]:
+        """Find other accounts in SQLite sharing near-duplicate text with `author`."""
+        own_rows = self.conn.execute(
+            """
+            SELECT comment_id, thread_id, author, subreddit, created_utc,
+                   shingle_count, sketch_json, band_0, band_1, band_2, band_3
+            FROM comment_shingles
+            WHERE LOWER(author) = LOWER(?)
+            ORDER BY created_utc DESC
+            LIMIT 40
+            """,
+            (author,),
+        ).fetchall()
+        if not own_rows:
+            return []
+        items = []
+        for r in own_rows:
+            try:
+                sketch = json.loads(r["sketch_json"])
+            except (ValueError, TypeError):
+                continue
+            items.append(
+                {
+                    "item_id": r["comment_id"],
+                    "thread_id": r["thread_id"],
+                    "author": r["author"],
+                    "subreddit": r["subreddit"],
+                    "created_utc": float(r["created_utc"]),
+                    "shingle_fp": {
+                        "shingle_count": int(r["shingle_count"]),
+                        "sketch": sketch,
+                        "bands": [r["band_0"], r["band_1"], r["band_2"], r["band_3"]],
+                    },
+                }
+            )
+        matches = self.query_cross_account_shingle_matches(items)
+        peers = []
+        for m in matches[:8]:
+            peer = m["author_b"] if m["author_a"].lower() == author.lower() else m["author_a"]
+            peers.append(
+                {
+                    "peer": peer,
+                    "max_similarity": m["max_similarity"],
+                    "match_count": m["match_count"],
+                    "distinct_threads": m["distinct_threads"],
+                    "cross_thread": m["cross_thread"],
+                    "min_delta_sec": m["min_delta_sec"],
+                }
+            )
+        return peers
 
     def get_author_baseline(self, author: str) -> Optional[dict[str, Any]]:
         row = self.conn.execute(
@@ -1662,11 +1941,13 @@ class RedditGraphDB:
         ]
         wl = self.get_watchlist_map({author}).get(author)
         wl_assoc = self.query_watchlisted_co_occurrences({author}, window_sec=300.0).get(author, [])
+        dup_peers = self.query_author_shingle_peers(author)
         return {
             "threads_in_db": threads_seen,
             "comments_in_db": int(comment_stats["cnt"] or 0),
             "max_recorded_score": round(float(comment_stats["max_score"] or 0.0), 1),
             "top_co_occurring_peers": top_peers,
+            "cross_account_duplicate_peers": dup_peers,
             "watchlist_entry": wl,
             "watchlisted_associations": wl_assoc,
         }
@@ -1922,6 +2203,9 @@ class RedditGraphDB:
                 sorted(WATCHLIST_BAD_VERDICTS),
             ).fetchone()[0]
         )
+        shingles_cnt = int(
+            self.conn.execute("SELECT COUNT(*) FROM comment_shingles").fetchone()[0]
+        )
         return {
             "total_threads": threads_cnt,
             "total_authors": authors_cnt,
@@ -1929,6 +2213,7 @@ class RedditGraphDB:
             "total_co_occurrences": edges_cnt,
             "subreddit_threads": sub_threads_cnt,
             "watchlist_count": watchlist_cnt,
+            "indexed_shingles": shingles_cnt,
         }
 
 
@@ -2180,6 +2465,7 @@ def evaluate_coordination_graph(
     comments: list[dict[str, Any]],
     current_edges: list[dict[str, Any]],
     window_sec: float,
+    shingle_items: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[dict[str, int], dict[str, list[str]], list[dict[str, Any]], dict[str, Any]]:
     """Compute Class 2 swarm scores, per-author flags, and cluster summaries."""
     current_authors: set[str] = {c["author"] for c in comments}
@@ -2195,6 +2481,11 @@ def evaluate_coordination_graph(
     )
     watchlist_map = db.get_watchlist_map(current_authors)
     wl_associations = db.query_watchlisted_co_occurrences(current_authors, window_sec)
+    shingle_matches = (
+        db.query_cross_account_shingle_matches(shingle_items)
+        if shingle_items
+        else []
+    )
 
     current_edge_by_pair: dict[tuple[str, str], dict[str, Any]] = {
         (e["author_a"], e["author_b"]): e for e in current_edges
@@ -2352,6 +2643,54 @@ def evaluate_coordination_graph(
             author_scores[u] = max(author_scores[u], bonus)
             author_flags[u].add("repeating_role_triple")
 
+    # Apply cross-account near-duplicate shingling signals (catches slow-drip linkless rings)
+    near_duplicate_links: list[dict[str, Any]] = []
+    for sm in shingle_matches:
+        a, b = sm["author_a"], sm["author_b"]
+        is_copycat = sm["max_similarity"] >= 0.75
+        pts = 55.0 if is_copycat else 42.0
+        sig_list = [
+            "cross_account_copycat_shingle" if is_copycat else "cross_account_near_duplicate"
+        ]
+        if sm["cross_thread"]:
+            pts += 12.0
+            sig_list.append("cross_thread_shingle_match")
+        if sm["match_count"] >= 2:
+            pts += 15.0
+        pts = min(100.0, pts)
+
+        for u in (a, b):
+            if u in current_authors:
+                wl_u = watchlist_map.get(u)
+                if wl_u and wl_u["verdict"].lower() == "benign":
+                    continue
+                author_scores[u] = max(author_scores[u], pts)
+                author_flags[u].update(sig_list)
+
+        near_duplicate_links.append(
+            {
+                "author_a": a,
+                "author_b": b,
+                "similarity": sm["max_similarity"],
+                "match_count": sm["match_count"],
+                "cross_thread": sm["cross_thread"],
+                "matched_thread_id": sm["sample_matched_thread"],
+                "min_delta_sec": sm["min_delta_sec"],
+            }
+        )
+        flagged_edges.append(
+            {
+                "author_a": a,
+                "author_b": b,
+                "distinct_threads": sm["distinct_threads"],
+                "rapid_threads": 0,
+                "current_delta_sec": sm["min_delta_sec"],
+                "same_branch": False,
+                "shared_domains": [],
+                "signals": sig_list,
+            }
+        )
+
     # Zero out Class 2 swarm scores for explicitly verified benign accounts
     for author, wl in watchlist_map.items():
         if wl["verdict"].lower() == "benign":
@@ -2429,6 +2768,7 @@ def evaluate_coordination_graph(
         "watchlist_map": watchlist_map,
         "watchlist_hits": watchlist_hits,
         "watchlist_associations": watchlist_assoc_out[:10],
+        "near_duplicate_links": near_duplicate_links[:6],
     }
     return final_scores, final_flags, clusters, graph_meta
 
@@ -2993,13 +3333,45 @@ def audit_thread_payload(
     )
     db.upsert_co_occurrences(current_edges)
 
-    # Stage 1B: Class 2 Coordination Graph + Watchlist queries
+    # Compute and persist 4-band MinHash shingle sketches for OP + comments
+    shingle_items: list[dict[str, Any]] = []
+    if not op_info["author_ignored"]:
+        op_text_for_shingles = f"{op_info['raw_title']}\n{op_info['raw_selftext']}"
+        op_fp = compute_shingle_fingerprint(op_text_for_shingles)
+        if op_fp is not None:
+            shingle_items.append(
+                {
+                    "item_id": f"t3_{op_info['thread_id']}",
+                    "thread_id": op_info["thread_id"],
+                    "author": op_info["author"],
+                    "subreddit": op_info["subreddit"],
+                    "created_utc": op_info["created_utc"],
+                    "shingle_fp": op_fp,
+                }
+            )
+    for c in comments:
+        c_fp = compute_shingle_fingerprint(c["raw_body"])
+        if c_fp is not None:
+            shingle_items.append(
+                {
+                    "item_id": c["comment_id"],
+                    "thread_id": c["thread_id"],
+                    "author": c["author"],
+                    "subreddit": op_info["subreddit"],
+                    "created_utc": c["created_utc"],
+                    "shingle_fp": c_fp,
+                }
+            )
+    db.upsert_comment_shingles(shingle_items)
+
+    # Stage 1B: Class 2 Coordination Graph + Watchlist + Cross-Account Shingling
     c2_scores, c2_flags, graph_clusters, graph_meta = evaluate_coordination_graph(
         db=db,
         op_info=op_info,
         comments=comments,
         current_edges=current_edges,
         window_sec=window_sec,
+        shingle_items=shingle_items,
     )
     watchlist_map: dict[str, dict[str, Any]] = graph_meta.get("watchlist_map") or {}
 
@@ -3198,6 +3570,7 @@ def audit_thread_payload(
         "repeating_role_patterns": graph_meta["repeating_role_patterns"],
         "watchlist_hits": graph_meta["watchlist_hits"],
         "watchlist_associations": graph_meta["watchlist_associations"],
+        "near_duplicate_links": graph_meta["near_duplicate_links"],
         "warnings": warnings,
     }
 

@@ -379,8 +379,44 @@ def inspect_account_data(
         score += 45
         flags.append("historical_agentic_artifact_leak")
 
-    # 5. SQLite graph & watchlist context
+    # 5. SQLite graph, cross-account shingling, & watchlist context
     graph_ctx = db.query_author_graph_summary(author)
+    # Also probe fetched recent items against stored comment_shingles without mutating DB
+    probe_items = []
+    for it in all_items[-40:]:
+        fp = core.compute_shingle_fingerprint(it["raw_text"])
+        if fp is not None:
+            probe_items.append(
+                {
+                    "item_id": f"{it['kind']}_{it['id']}" if it["id"] else f"probe_{len(probe_items)}",
+                    "thread_id": f"inspect_{it['id']}",
+                    "author": author,
+                    "subreddit": it["subreddit"],
+                    "created_utc": it["created_utc"],
+                    "shingle_fp": fp,
+                }
+            )
+    if probe_items:
+        existing_peers = {
+            p["peer"].lower(): p for p in graph_ctx.get("cross_account_duplicate_peers", [])
+        }
+        for m in db.query_cross_account_shingle_matches(probe_items)[:8]:
+            peer = m["author_b"] if m["author_a"].lower() == author.lower() else m["author_a"]
+            p_key = peer.lower()
+            cand = {
+                "peer": peer,
+                "max_similarity": m["max_similarity"],
+                "match_count": m["match_count"],
+                "distinct_threads": m["distinct_threads"],
+                "cross_thread": m["cross_thread"],
+                "min_delta_sec": m["min_delta_sec"],
+            }
+            if p_key not in existing_peers or cand["max_similarity"] > existing_peers[p_key]["max_similarity"]:
+                existing_peers[p_key] = cand
+        graph_ctx["cross_account_duplicate_peers"] = sorted(
+            existing_peers.values(), key=lambda x: (-x["max_similarity"], -x["match_count"])
+        )[:8]
+
     wl_entry = graph_ctx.get("watchlist_entry")
     if wl_entry and wl_entry["verdict"].lower() in core.WATCHLIST_BAD_VERDICTS:
         score = max(score, 75)
@@ -388,6 +424,11 @@ def inspect_account_data(
     if graph_ctx.get("watchlisted_associations"):
         score += 20
         flags.append("cooccurs_with_watchlisted")
+    dup_peers = graph_ctx.get("cross_account_duplicate_peers") or []
+    if dup_peers:
+        best_sim = max(p["max_similarity"] for p in dup_peers)
+        score += 35 if best_sim >= 0.75 else 25
+        flags.append("cross_account_near_duplicate")
 
     final_score = min(100, int(round(score)))
     if final_score >= 80:
