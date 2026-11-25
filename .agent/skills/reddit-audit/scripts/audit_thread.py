@@ -43,6 +43,7 @@ REQUEST_DELAY_SEC = 2.0
 HTTP_TIMEOUT_SEC = 20.0
 PROFILE_CACHE_TTL_SEC = 86400  # 24 hours
 PROFILE_COMMENTS_LIMIT = 15
+DEFAULT_STAGE2_SPOT_CHECKS = 2
 
 OP_CONTENT_MAX_CHARS = 600
 COMMENT_CONTENT_MAX_CHARS = 500
@@ -111,6 +112,8 @@ REFERENCE_DOMAINS = {
     "youtu.be",
     "imgur.com",
     "i.imgur.com",
+    "ibb.co",
+    "i.ibb.co",
     "bbc.com",
     "bbc.co.uk",
     "reuters.com",
@@ -210,6 +213,13 @@ RE_OP_CTA = re.compile(
     r"dm me for|link in (?:bio|profile|comments)|use code\s+\w+|"
     r"free trial|limited spots|check out my (?:tool|app|saas|newsletter)|"
     r"sign up (?:here|now|today)|join (?:our|my) (?:discord|telegram|waitlist))"
+)
+
+RE_OP_PROMO_PITCH = re.compile(
+    r"(?i)(?:\b(?:i|we)\s+(?:built|launched|created|made)\s+(?:a|an|this)\b"
+    r"|\balternative\s+(?:to|that\s+focuses)\b"
+    r"|\b(?:revenue[- ]funded|buyback\s+model|tokenomics|expansion\s+milestone|"
+    r"worth\s+discussing|early\s+access|beta\s+testers?)\b)"
 )
 
 # Neutralization regexes (defang prompt boundaries in untrusted Reddit text)
@@ -2353,6 +2363,15 @@ def score_op_class3(op_info: dict[str, Any]) -> tuple[int, list[str]]:
         score += 22
         flags.append("op_engagement_bait_cta")
 
+    non_ref_domains = [d for d in op_info["domains"] if not is_reference_domain(d)]
+    selftext_len = len(op_info["raw_selftext"])
+    if op_info["is_self"] and selftext_len >= 300 and non_ref_domains and RE_OP_PROMO_PITCH.search(combined):
+        score += 18
+        flags.append("op_promotional_pitch")
+    if op_info["is_self"] and selftext_len >= 600 and len(non_ref_domains) >= 2:
+        score += 14
+        flags.append("op_multi_domain_self_promo")
+
     if op_info["has_shortener"]:
         score += 18
         flags.append("op_url_shortener")
@@ -2873,27 +2892,72 @@ def score_profile_drift(
     score = 0
     drift_flags: list[str] = []
 
+    # 1. Dormancy wake-up (evaluated first so length/hour checks can use corroboration)
+    dormancy_days: Optional[float] = None
+    if latest_hist_utc is not None and current_created_utc > latest_hist_utc:
+        dormancy_days = round((current_created_utc - latest_hist_utc) / 86400.0, 1)
+        if dormancy_days >= 90.0:
+            score += 30
+            drift_flags.append("dormant_account_reactivation")
+        elif dormancy_days >= 30.0:
+            score += 15
+            drift_flags.append("extended_inactivity_gap")
+    has_dormancy = dormancy_days is not None and dormancy_days >= 30.0
+
+    # 2. Lightweight stylometric baseline drift (casual -> formal/structured shift)
+    if sample_size >= 5 and hist_style and current_text:
+        cur_style = compute_text_stylometry(current_text)
+        hist_casual = hist_style.get("casual_rate", 0.0)
+        hist_md = hist_style.get("markdown_rate", 0.0)
+        hist_sent = hist_style.get("avg_sentence_words", 0.0)
+        hist_em = hist_style.get("em_dash_per_1k", 0.0)
+
+        if (
+            hist_casual >= 0.60
+            and hist_md <= 0.15
+            and current_char_len >= 220
+            and cur_style["is_casual"] == 0.0
+            and (
+                cur_style["has_markdown"] == 1.0
+                or (hist_sent > 0 and hist_sent <= 12.0 and cur_style["avg_sentence_words"] >= 18.0)
+            )
+        ):
+            score += 22
+            drift_flags.append("stylometric_formality_jump")
+
+        if (
+            hist_em < 1.5
+            and cur_style["em_dash_count"] >= 2.0
+            and current_char_len >= 200
+        ):
+            score += 15
+            drift_flags.append("stylometric_punctuation_shift")
+    has_style_drift = (
+        "stylometric_formality_jump" in drift_flags
+        or "stylometric_punctuation_shift" in drift_flags
+    )
+
     len_ratio: Optional[float] = None
     if sample_size < 3:
         if current_char_len >= 600:
             score += 10
             drift_flags.append("sparse_history_long_post")
     else:
-        # 1. Text length drift
+        # 3. Text length drift (suppress normal variance & short-reply drops; require extreme or corroborated spikes)
         if median_len is not None and median_len > 0:
             len_ratio = round(current_char_len / median_len, 2)
-            if len_ratio >= 4.0 and current_char_len >= 300:
-                score += 38
+            if len_ratio >= 12.0 and current_char_len >= 1000:
+                score += 30
                 drift_flags.append("length_drift_spike")
-            elif len_ratio >= 2.5 and current_char_len >= 200:
-                score += 22
+            elif len_ratio >= 4.0 and current_char_len >= 300 and (has_style_drift or has_dormancy):
+                score += 34
+                drift_flags.append("length_drift_spike")
+            elif len_ratio >= 5.0 and current_char_len >= 500:
+                score += 14
                 drift_flags.append("length_drift_moderate")
-            elif median_len >= 400 and len_ratio <= 0.15:
-                score += 10
-                drift_flags.append("length_drift_drop")
 
-        # 2. Active UTC hours drift
-        if active_hours:
+        # 4. Active UTC hours drift (require larger baseline & wider circular gap)
+        if sample_size >= 6 and active_hours:
             total_obs = sum(active_hours.values())
             near_obs = sum(
                 cnt
@@ -2905,52 +2969,12 @@ def score_profile_drift(
             )
             near_frac = near_obs / max(total_obs, 1)
 
-            if sample_size >= 5 and near_obs == 0 and min_dist >= 4:
-                score += 32
+            if sample_size >= 8 and near_obs == 0 and min_dist >= 6:
+                score += 24 if (has_dormancy or has_style_drift) else 16
                 drift_flags.append("active_hours_shift_strong")
-            elif near_frac < 0.10 and min_dist >= 3:
-                score += 18
+            elif near_frac < 0.10 and min_dist >= 5:
+                score += 10
                 drift_flags.append("active_hours_shift_moderate")
-
-        # 3. Lightweight stylometric baseline drift (casual -> formal/structured shift)
-        if sample_size >= 5 and hist_style and current_text:
-            cur_style = compute_text_stylometry(current_text)
-            hist_casual = hist_style.get("casual_rate", 0.0)
-            hist_md = hist_style.get("markdown_rate", 0.0)
-            hist_sent = hist_style.get("avg_sentence_words", 0.0)
-            hist_em = hist_style.get("em_dash_per_1k", 0.0)
-
-            if (
-                hist_casual >= 0.60
-                and hist_md <= 0.15
-                and current_char_len >= 220
-                and cur_style["is_casual"] == 0.0
-                and (
-                    cur_style["has_markdown"] == 1.0
-                    or (hist_sent > 0 and hist_sent <= 12.0 and cur_style["avg_sentence_words"] >= 18.0)
-                )
-            ):
-                score += 22
-                drift_flags.append("stylometric_formality_jump")
-
-            if (
-                hist_em < 1.5
-                and cur_style["em_dash_count"] >= 2.0
-                and current_char_len >= 200
-            ):
-                score += 15
-                drift_flags.append("stylometric_punctuation_shift")
-
-    # 4. Dormancy wake-up (if latest historical timestamp available)
-    dormancy_days: Optional[float] = None
-    if latest_hist_utc is not None and current_created_utc > latest_hist_utc:
-        dormancy_days = round((current_created_utc - latest_hist_utc) / 86400.0, 1)
-        if dormancy_days >= 90.0:
-            score += 30
-            drift_flags.append("dormant_account_reactivation")
-        elif dormancy_days >= 30.0:
-            score += 15
-            drift_flags.append("extended_inactivity_gap")
 
     top_hours = [
         hr
@@ -2973,6 +2997,90 @@ def score_profile_drift(
     return min(100, score), drift_info
 
 
+def select_spot_check_candidates(
+    op_info: dict[str, Any],
+    comments: list[dict[str, Any]],
+    already_selected: list[str],
+    watchlist_map: Optional[dict[str, dict[str, Any]]],
+    max_slots: int,
+) -> list[str]:
+    """Pick up to `max_slots` high-value accounts to Stage-2 spot-check when prelim C2/C3 is 0."""
+    if max_slots <= 0:
+        return []
+
+    skip = set(already_selected)
+    for author, wl in (watchlist_map or {}).items():
+        if str(wl.get("verdict", "")).lower() == "benign":
+            skip.add(author)
+
+    by_author: dict[str, dict[str, Any]] = {}
+    for c in comments:
+        author = c["author"]
+        if author in skip:
+            continue
+        body = c.get("raw_body") or ""
+        char_len = int(c.get("char_len") or 0)
+        has_non_ref = any(not is_reference_domain(d) for d in (c.get("domains") or []))
+        edit_delay = c.get("edit_delay_sec")
+        has_edit = edit_delay is not None and float(edit_delay) >= 60.0
+        has_polish = False
+        if char_len >= 180:
+            style = compute_text_stylometry(body)
+            if (
+                style["em_dash_count"] >= 1.0
+                or style["has_markdown"] == 1.0
+                or any(ch in body for ch in "“”‘’")
+            ):
+                has_polish = True
+        cps = float((c.get("features") or {}).get("chars_per_sec") or 0.0)
+
+        rec = by_author.get(author)
+        if rec is None:
+            by_author[author] = {
+                "comment_count": 1,
+                "max_char_len": char_len,
+                "has_non_ref_domain": has_non_ref,
+                "has_edit": has_edit,
+                "has_polish": has_polish,
+                "max_cps": cps,
+            }
+        else:
+            rec["comment_count"] += 1
+            rec["max_char_len"] = max(rec["max_char_len"], char_len)
+            rec["has_non_ref_domain"] = rec["has_non_ref_domain"] or has_non_ref
+            rec["has_edit"] = rec["has_edit"] or has_edit
+            rec["has_polish"] = rec["has_polish"] or has_polish
+            rec["max_cps"] = max(rec["max_cps"], cps)
+
+    ranked: list[tuple[tuple[int, int, int, int, str], str]] = []
+    for author, rec in by_author.items():
+        substantial = 1 if rec["max_char_len"] >= 180 else 0
+        pts = (
+            (3 if rec["has_non_ref_domain"] else 0)
+            + (2 if rec["has_edit"] else 0)
+            + (2 if rec["max_char_len"] >= 400 else 0)
+            + (2 if rec["has_polish"] else 0)
+            + (1 if rec["comment_count"] >= 2 else 0)
+            + (1 if rec["max_cps"] >= 5.0 else 0)
+        )
+        sort_key = (-substantial, -pts, -rec["max_char_len"], -rec["comment_count"], author)
+        ranked.append((sort_key, author))
+
+    ranked.sort(key=lambda item: item[0])
+    picked = [author for _, author in ranked[:max_slots]]
+
+    if (
+        len(picked) < max_slots
+        and not op_info.get("author_ignored")
+        and op_info["author"] not in skip
+        and op_info["author"] not in picked
+        and (len(op_info.get("raw_selftext") or "") >= 200 or bool(op_info.get("domains")))
+    ):
+        picked.append(op_info["author"])
+
+    return picked[:max_slots]
+
+
 def run_stage2_profile_checks(
     db: RedditGraphDB,
     fetcher: RateLimitedFetcher,
@@ -2983,8 +3091,10 @@ def run_stage2_profile_checks(
     mock_mode: bool,
     mock_profiles: Optional[dict[str, Any]],
     warnings: list[str],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Stage-2 fetch ONLY for top 3 comment authors (+ flagged OP) not checked in 24h."""
+    watchlist_map: Optional[dict[str, dict[str, Any]]] = None,
+    spot_check_n: int = DEFAULT_STAGE2_SPOT_CHECKS,
+) -> tuple[dict[str, dict[str, Any]], list[str], list[str]]:
+    """Stage-2 fetch for top 3 comment suspects (+ flagged OP), plus up to `spot_check_n` spot-checks."""
     # Rank unique comment authors by their highest preliminary score
     best_by_author: dict[str, int] = {}
     for c in comments:
@@ -3003,6 +3113,19 @@ def run_stage2_profile_checks(
     op_flagged = op_prelim_score >= 35 and not op_info["author_ignored"]
     if op_flagged and op_info["author"] not in candidates:
         candidates.append(op_info["author"])
+
+    spot_checked: list[str] = []
+    if not no_profile_fetch:
+        remaining_spot_slots = max(0, max(0, spot_check_n) - len(ranked_comment_authors))
+        if remaining_spot_slots > 0:
+            spot_checked = select_spot_check_candidates(
+                op_info=op_info,
+                comments=comments,
+                already_selected=candidates,
+                watchlist_map=watchlist_map,
+                max_slots=remaining_spot_slots,
+            )
+            candidates.extend(spot_checked)
 
     now_utc = time.time()
     baselines_out: dict[str, dict[str, Any]] = {}
@@ -3059,7 +3182,7 @@ def run_stage2_profile_checks(
         computed["fetch_status"] = "fetched_live" if mock_profiles is None else "fetched_mock"
         baselines_out[author] = computed
 
-    return baselines_out, candidates
+    return baselines_out, candidates, spot_checked
 
 
 # ---------------------------------------------------------------------------
@@ -3177,6 +3300,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-profile-fetch",
         action="store_true",
         help="Disable stage-2 /user/{author}/comments.json fetches.",
+    )
+    parser.add_argument(
+        "--spot-check",
+        type=int,
+        default=DEFAULT_STAGE2_SPOT_CHECKS,
+        help=(
+            "Minimum number of accounts to Stage-2 Class 1 spot-check per thread "
+            "even when prelim C2/C3 scores are 0 (default: 2; 0 disables)."
+        ),
     )
     parser.add_argument(
         "--window-sec",
@@ -3308,6 +3440,7 @@ def audit_thread_payload(
     mock_mode: bool = False,
     mock_profiles: Optional[dict[str, Any]] = None,
     extra_warnings: Optional[list[str]] = None,
+    spot_check_n: int = DEFAULT_STAGE2_SPOT_CHECKS,
 ) -> dict[str, Any]:
     """Run the full 3-class audit pipeline on a parsed Reddit thread JSON payload."""
     warnings: list[str] = list(extra_warnings or [])
@@ -3396,8 +3529,8 @@ def audit_thread_payload(
             0, c["class2_score"], c["class3_score"]
         )
 
-    # Stage 2: Class 1 Account Takeover (Top 3 authors + flagged OP, 24h cache)
-    baselines_by_author, stage2_candidates = run_stage2_profile_checks(
+    # Stage 2: Class 1 Account Takeover (Top 3 authors + flagged OP + spot-checks, 24h cache)
+    baselines_by_author, stage2_candidates, stage2_spot_checked = run_stage2_profile_checks(
         db=db,
         fetcher=fetcher,
         op_info=op_info,
@@ -3407,6 +3540,8 @@ def audit_thread_payload(
         mock_mode=mock_mode,
         mock_profiles=mock_profiles,
         warnings=warnings,
+        watchlist_map=watchlist_map,
+        spot_check_n=max(0, min(5, spot_check_n)),
     )
 
     # Apply Class 1 drift scoring (including lightweight stylometric drift)
@@ -3566,6 +3701,7 @@ def audit_thread_payload(
         "comments_clean": len(comments) - len(anomalous_comments),
         "ignored_filtered": ignored_count,
         "stage2_candidates": stage2_candidates,
+        "stage2_spot_checked": stage2_spot_checked,
         "power_users_flagged": sorted(graph_meta["power_users_flagged"].keys()),
         "repeating_role_patterns": graph_meta["repeating_role_patterns"],
         "watchlist_hits": graph_meta["watchlist_hits"],
@@ -3672,6 +3808,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             mock_mode=mock_mode,
             mock_profiles=mock_profiles,
             extra_warnings=fetch_warnings,
+            spot_check_n=max(0, min(5, args.spot_check)),
         )
     except ValueError as exc:
         return emit_error("parse_error", str(exc))

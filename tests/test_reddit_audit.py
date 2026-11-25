@@ -491,6 +491,217 @@ class TestRedditAuditSkill(unittest.TestCase):
             peers = [p["peer"] for p in out_a["graph_context"]["cross_account_duplicate_peers"]]
             self.assertIn("drip_bot_alpha", peers)
 
+    def test_stage2_spot_check_on_clean_thread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "spot.db"
+            t0 = 1795460834.0
+            long_polished = (
+                "This is a carefully structured reflection on the broader trade-offs — "
+                "looking closely at reliability, **operational overhead**, and team velocity across "
+                "several quarters of real production usage. When teams underestimate maintenance "
+                "costs early on, the hidden tax compounds quietly until every minor release feels "
+                "riskier than it should be, even when individual benchmarks look great on paper."
+            )
+            long_benign = (
+                "From a completely different angle, gardening in raised cedar beds during late "
+                "autumn requires balancing compost moisture, mulching depth, and drainage layers "
+                "before the first hard frost arrives. Neighbors often swap heirloom garlic cloves "
+                "and cover crop seeds right after harvest because perennial herbs establish stronger "
+                "root networks through mild winter weeks when soil temperatures stay steady."
+            )
+            th = make_thread(
+                "spot1",
+                "testsub",
+                "plain_op",
+                t0,
+                [
+                    cnode("c1", "spot1", "t3_spot1", "sleeper_ai", long_polished, t0 + 1800),
+                    cnode("c2", "spot1", "t3_spot1", "casual_user_1", "nice post", t0 + 2000),
+                    cnode("c3", "spot1", "t3_spot1", "benign_long", long_benign, t0 + 2200),
+                ],
+            )
+            tf = tmp_path / "thread.json"
+            tf.write_text(json.dumps(th), encoding="utf-8")
+
+            base_old = t0 - 120 * 86400
+            day_start = base_old - (base_old % 86400) + 3 * 3600
+            hist_sleeper = [
+                {
+                    "kind": "t1",
+                    "data": {
+                        "link_id": f"t3_old{i}",
+                        "body": "lol yeah totally agree man",
+                        "created_utc": day_start - i * 86400,
+                    },
+                }
+                for i in range(8)
+            ]
+            hist_casual = [
+                {
+                    "kind": "t1",
+                    "data": {
+                        "link_id": f"t3_c_old{i}",
+                        "body": "nice post lol",
+                        "created_utc": t0 - (i + 1) * 3600,
+                    },
+                }
+                for i in range(6)
+            ]
+            mp = tmp_path / "mp.json"
+            mp.write_text(
+                json.dumps(
+                    {
+                        "sleeper_ai": {"kind": "Listing", "data": {"children": hist_sleeper}},
+                        "casual_user_1": {"kind": "Listing", "data": {"children": hist_casual}},
+                        "benign_long": {"kind": "Listing", "data": {"children": hist_sleeper}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Mark benign_long as benign on watchlist before running
+            rc_w, _, _ = run_cli(WATCHLIST, "--db", str(db), "add", "benign_long", "--verdict", "benign")
+            self.assertEqual(rc_w, 0)
+
+            # 1. Default --spot-check 2 catches sleeper_ai and skips benign_long
+            rc1, out1, _ = run_cli(
+                AUDIT_THREAD, "--mock", str(tf), "--mock-profiles", str(mp), "--db", str(db)
+            )
+            self.assertEqual(rc1, 0)
+            self.assertIn("sleeper_ai", out1["audit_meta"]["stage2_spot_checked"])
+            self.assertNotIn("benign_long", out1["audit_meta"]["stage2_spot_checked"])
+            sleeper = next(a for a in out1["top_anomalies"] if a["author"] == "sleeper_ai")
+            self.assertGreater(sleeper["sub_scores"]["class1_takeover"], 0)
+            self.assertEqual(sleeper["sub_scores"]["class2_swarm"], 0)
+            self.assertEqual(sleeper["sub_scores"]["class3_agentic"], 0)
+            self.assertTrue(
+                {
+                    "length_drift_spike",
+                    "dormant_account_reactivation",
+                    "stylometric_formality_jump",
+                }.issubset(set(sleeper["flags"])),
+                sleeper["flags"],
+            )
+
+            # 2. --spot-check 0 disables spot-checking on fresh DB
+            db0 = tmp_path / "spot0.db"
+            rc2, out2, _ = run_cli(
+                AUDIT_THREAD, "--mock", str(tf), "--mock-profiles", str(mp), "--spot-check", "0", "--db", str(db0)
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(out2["audit_meta"]["stage2_candidates"], [])
+            self.assertEqual(out2["audit_meta"]["stage2_spot_checked"], [])
+            self.assertEqual(out2["audit_meta"]["comments_flagged"], 0)
+
+            # 3. --no-profile-fetch disables spot-checking on fresh DB
+            db_nopf = tmp_path / "spot_nopf.db"
+            rc3, out3, _ = run_cli(
+                AUDIT_THREAD, "--mock", str(tf), "--mock-profiles", str(mp), "--no-profile-fetch", "--db", str(db_nopf)
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(out3["audit_meta"]["stage2_spot_checked"], [])
+            self.assertEqual(out3["audit_meta"]["comments_flagged"], 0)
+
+    def test_class1_noise_reduction_and_op_promo_signals(self):
+        # 1. Verbose author posting a short reply must NOT trigger length_drift_drop
+        ts_base = 1795460834.0
+        cur_hr = core.utc_hour_from_ts(ts_base)
+        baseline_verbose = {
+            "sample_size": 10,
+            "median_len": 800.0,
+            "active_hours": {cur_hr: 5, (cur_hr + 4) % 24: 5},
+            "stylometry": {"avg_sentence_words": 14.0, "casual_rate": 0.1, "markdown_rate": 0.0, "em_dash_per_1k": 0.0},
+        }
+        sc_short, dr_short = core.score_profile_drift(
+            baseline_verbose, current_char_len=7, current_created_utc=ts_base, current_text="Thanks!"
+        )
+        self.assertEqual(sc_short, 0)
+        self.assertEqual(dr_short["drift_flags"], [])
+
+        # 2. Small sample_size (4) or 4h gap on n=15 must NOT fire active_hours_shift_*
+        sc_small_n, dr_small_n = core.score_profile_drift(
+            {"sample_size": 4, "median_len": 100.0, "active_hours": {(cur_hr + 8) % 24: 4}, "stylometry": {}},
+            current_char_len=120,
+            current_created_utc=ts_base,
+            current_text="normal reply here",
+        )
+        self.assertEqual(sc_small_n, 0)
+        self.assertEqual(dr_small_n["drift_flags"], [])
+
+        sc_4h_gap, dr_4h_gap = core.score_profile_drift(
+            {"sample_size": 15, "median_len": 100.0, "active_hours": {(cur_hr + 4) % 24: 15}, "stylometry": {}},
+            current_char_len=250,
+            current_created_utc=ts_base,
+            current_text="A normal moderately longer human reply in a discussion.",
+        )
+        self.assertEqual(sc_4h_gap, 0)
+        self.assertEqual(dr_4h_gap["drift_flags"], [])
+
+        # Uncorroborated 6h active-hours gap stays green (< 30)
+        sc_6h_uncorr, dr_6h_uncorr = core.score_profile_drift(
+            {"sample_size": 10, "median_len": 100.0, "active_hours": {(cur_hr + 6) % 24: 10}, "stylometry": {}},
+            current_char_len=120,
+            current_created_utc=ts_base,
+            current_text="normal reply",
+        )
+        self.assertEqual(sc_6h_uncorr, 16)
+        self.assertEqual(dr_6h_uncorr["drift_flags"], ["active_hours_shift_strong"])
+
+        # 3. Uncorroborated 6x/600-char stays green (14); extreme >=12x/>=1000 triggers spike (30);
+        # corroborated >=4x/>=300 + dormancy triggers spike
+        base_len = {"sample_size": 10, "median_len": 100.0, "active_hours": {cur_hr: 10}, "stylometry": {}}
+        sc_mod, dr_mod = core.score_profile_drift(
+            base_len, current_char_len=600, current_created_utc=ts_base, current_text="plain text " * 50
+        )
+        self.assertEqual(sc_mod, 14)
+        self.assertEqual(dr_mod["drift_flags"], ["length_drift_moderate"])
+
+        sc_ext, dr_ext = core.score_profile_drift(
+            base_len, current_char_len=1300, current_created_utc=ts_base, current_text="plain text " * 110
+        )
+        self.assertEqual(sc_ext, 30)
+        self.assertEqual(dr_ext["drift_flags"], ["length_drift_spike"])
+
+        sc_corr, dr_corr = core.score_profile_drift(
+            base_len,
+            current_char_len=450,
+            current_created_utc=ts_base,
+            latest_hist_utc=ts_base - 40 * 86400,
+            current_text="plain text " * 40,
+        )
+        self.assertGreaterEqual(sc_corr, 49)
+        self.assertIn("length_drift_spike", dr_corr["drift_flags"])
+        self.assertIn("extended_inactivity_gap", dr_corr["drift_flags"])
+
+        # 4. OP promotional pitch & multi-domain self-promo vs benign image/news posts
+        promo_op = {
+            "raw_title": "CoinGecko alternative that focuses on custom date-range performance",
+            "raw_selftext": ("We built a tracking tool with live metrics across exchanges. " * 14).strip(),
+            "is_self": True,
+            "domains": ["cointrends.xyz", "coinmarketcap.com"],
+            "has_shortener": False,
+            "has_tracking": False,
+            "has_funnel": False,
+            "edit_delay_sec": None,
+        }
+        op_sc, op_fl = core.score_op_class3(promo_op)
+        self.assertEqual(op_sc, 32)
+        self.assertEqual(set(op_fl), {"op_promotional_pitch", "op_multi_domain_self_promo"})
+
+        img_op = {
+            "raw_title": "Funny meme comparison",
+            "raw_selftext": ("Normal personal story text here without promo links. " * 14).strip(),
+            "is_self": True,
+            "domains": ["ibb.co"],
+            "has_shortener": False,
+            "has_tracking": False,
+            "has_funnel": False,
+            "edit_delay_sec": None,
+        }
+        self.assertEqual(core.score_op_class3(img_op), (0, []))
+        self.assertTrue(core.is_reference_domain("ibb.co"))
+
 
 if __name__ == "__main__":
     unittest.main()
