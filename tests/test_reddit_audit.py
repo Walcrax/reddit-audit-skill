@@ -679,7 +679,7 @@ class TestRedditAuditSkill(unittest.TestCase):
             "raw_title": "CoinGecko alternative that focuses on custom date-range performance",
             "raw_selftext": ("We built a tracking tool with live metrics across exchanges. " * 14).strip(),
             "is_self": True,
-            "domains": ["cointrends.xyz", "coinmarketcap.com"],
+            "domains": ["cointrends.xyz", "cointrends-blog.example"],
             "has_shortener": False,
             "has_tracking": False,
             "has_funnel": False,
@@ -701,6 +701,230 @@ class TestRedditAuditSkill(unittest.TestCase):
         }
         self.assertEqual(core.score_op_class3(img_op), (0, []))
         self.assertTrue(core.is_reference_domain("ibb.co"))
+        self.assertTrue(core.is_reference_domain("coinmarketcap.com"))
+        self.assertTrue(core.is_reference_domain("coingecko.com"))
+
+    def test_arctic_shift_422_retry_and_tree_fallback(self):
+        # 1. Transient HTTP 422 twice then 200 on Arctic Shift retries cleanly
+        calls = []
+
+        def fake_retry_urlopen(req, timeout=20.0):
+            calls.append(req.full_url)
+            if len(calls) <= 2:
+                raise urllib.error.HTTPError(
+                    req.full_url, 422, "Unprocessable Entity", {}, io.BytesIO(b"busy")
+                )
+            return FakeResp(json.dumps({"data": [{"id": "c1"}]}).encode())
+
+        f_retry = core.RateLimitedFetcher(delay_sec=0.0, use_oauth=False, source="arctic-shift")
+        with mock.patch("urllib.request.urlopen", side_effect=fake_retry_urlopen):
+            data, err = f_retry.fetch_json(
+                "https://arctic-shift.photon-reddit.com/api/comments/search?author=alice&limit=30"
+            )
+        self.assertIsNone(err)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(data, {"data": [{"id": "c1"}]})
+
+        # 2. Persistent 422 on /comments/search falls back to /comments/tree without bogus lag warning
+        f_tree = core.RateLimitedFetcher(delay_sec=0.0, use_oauth=False, source="arctic-shift")
+        tree_node = cnode("c1", "t99", "t3_t99", "alice", "Recovered via tree", 1795400100.0)
+
+        def fake_fetch_json(url):
+            if "/posts/ids" in url:
+                return {
+                    "data": [
+                        {
+                            "id": "t99",
+                            "subreddit": "altcoin",
+                            "author": "op_user",
+                            "title": "Test",
+                            "selftext": "",
+                            "created_utc": 1795400000.0,
+                            "num_comments": 1,
+                        }
+                    ]
+                }, None
+            if "/comments/search" in url:
+                return None, {"code": 422, "type": "http_error", "message": "HTTP 422: Unprocessable Entity"}
+            if "/comments/tree" in url:
+                return {"data": [tree_node]}, None
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with mock.patch.object(f_tree, "fetch_json", side_effect=fake_fetch_json):
+            payload, t_err, notes = f_tree.fetch_thread_arctic("t99", max_comments=50)
+        self.assertIsNone(t_err)
+        self.assertEqual(notes, [])
+        _, comments, _ = core.parse_reddit_thread(payload, set(), max_comments=50)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["raw_body"], "Recovered via tree")
+
+    def test_op_promo_non_self_and_single_author_repeat_promoter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "promo.db"
+            t0 = 1795400000.0
+
+            for idx in range(1, 4):
+                th = make_thread(
+                    f"pr{idx}",
+                    "altcoin",
+                    "solo_shill",
+                    t0 + idx * 3600,
+                    [cnode(f"pc{idx}", f"pr{idx}", f"t3_pr{idx}", f"reader_{idx}", "Interesting", t0 + idx * 3600 + 200)],
+                )
+                post_data = th[0]["data"]["children"][0]["data"]
+                post_data["is_self"] = False
+                post_data["url"] = "https://i.redd.it/example.png"
+                post_data["title"] = f"Project update #{idx}: revenue-funded buyback model is worth discussing"
+                post_data["selftext"] = (
+                    "Most projects promise adoption while this one operates globally with real payments "
+                    "and transparent metrics on https://pesabase.example/docs and https://medium.example/post. "
+                    * 5
+                ).strip()
+                pf = tmp_path / f"pr{idx}.json"
+                pf.write_text(json.dumps(th), encoding="utf-8")
+                rc, out, _ = run_cli(AUDIT_THREAD, "--mock", str(pf), "--db", str(db))
+                self.assertEqual(rc, 0)
+                op = out["op_analysis"]
+                self.assertIn("op_promotional_pitch", op["flags"])
+                self.assertIn("op_multi_domain_self_promo", op["flags"])
+                if idx == 1:
+                    self.assertEqual(op["sub_scores"]["class2_swarm"], 0)
+                elif idx == 2:
+                    self.assertEqual(op["sub_scores"]["class2_swarm"], 26)
+                    self.assertIn("repeat_domain_promoter", op["flags"])
+                else:
+                    self.assertEqual(op["sub_scores"]["class2_swarm"], 48)
+                    self.assertIn("repeat_domain_promoter", op["flags"])
+                    self.assertGreaterEqual(op["anomaly_score"], 56)
+
+    def test_stage2_self_duplication_and_domain_concentration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "stage2_beh.db"
+            t0 = 1795460834.0
+            th = make_thread(
+                "s2b",
+                "SaaS",
+                "plain_op",
+                t0,
+                [
+                    cnode(
+                        "c1",
+                        "s2b",
+                        "t3_s2b",
+                        "stealth_loop_shill",
+                        "Check out https://acme-ops.example/trial for our workflow tool today!",
+                        t0 + 1800,
+                    )
+                ],
+            )
+            tf = tmp_path / "thread.json"
+            tf.write_text(json.dumps(th), encoding="utf-8")
+
+            hist = []
+            for i in range(10):
+                body = (
+                    f"We switched our engineering team to AcmeOps last quarter and cut webhook failures "
+                    f"in half immediately, full details at https://acme-ops.example/case-{i % 2}"
+                    if i < 6
+                    else f"Totally agree, reliable queues save hours every week #{i}."
+                )
+                hist.append(
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "link_id": f"t3_hist{i}",
+                            "body": body,
+                            "created_utc": t0 - (i + 1) * 3600,
+                        },
+                    }
+                )
+            mp = tmp_path / "mp.json"
+            mp.write_text(
+                json.dumps({"stealth_loop_shill": {"kind": "Listing", "data": {"children": hist}}}),
+                encoding="utf-8",
+            )
+
+            rc1, out1, _ = run_cli(
+                AUDIT_THREAD, "--mock", str(tf), "--mock-profiles", str(mp), "--db", str(db)
+            )
+            self.assertEqual(rc1, 0)
+            shill = next(a for a in out1["top_anomalies"] if a["author"] == "stealth_loop_shill")
+            self.assertIn("stage2_self_duplication_loop", shill["flags"])
+            self.assertIn("stage2_domain_concentration", shill["flags"])
+            self.assertGreaterEqual(shill["sub_scores"]["class1_takeover"], 52)
+
+            # Cached 24h run retains Stage-2 behavioral flags
+            rc2, out2, _ = run_cli(AUDIT_THREAD, "--mock", str(tf), "--db", str(db))
+            self.assertEqual(rc2, 0)
+            shill2 = next(a for a in out2["top_anomalies"] if a["author"] == "stealth_loop_shill")
+            self.assertEqual(shill2["profile_drift"]["status"], "cached_24h")
+            self.assertIn("stage2_self_duplication_loop", shill2["flags"])
+            self.assertIn("stage2_domain_concentration", shill2["flags"])
+
+    def test_stage2_robotic_cron_cadence_and_per_host_delay(self):
+        # 1. Stage-2 robotic + cron cadence detection (0 extra HTTP calls, persists on 24h cache)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "cadence.db"
+            t0 = 1795460400.0  # Exact 900s boundary
+            th = make_thread(
+                "cad1",
+                "SaaS",
+                "plain_op",
+                t0,
+                [cnode("c1", "cad1", "t3_cad1", "cron_bot", "Clean looking comment.", t0 + 900)],
+            )
+            tf = tmp_path / "thread.json"
+            tf.write_text(json.dumps(th), encoding="utf-8")
+
+            hist = [
+                {
+                    "kind": "t1",
+                    "data": {
+                        "link_id": f"t3_h{i}",
+                        "body": f"Distinct short update number {i} on topic {i}.",
+                        "created_utc": t0 - (i + 1) * 900.0,
+                    },
+                }
+                for i in range(12)
+            ]
+            mp = tmp_path / "mp.json"
+            mp.write_text(
+                json.dumps({"cron_bot": {"kind": "Listing", "data": {"children": hist}}}),
+                encoding="utf-8",
+            )
+
+            rc1, out1, _ = run_cli(
+                AUDIT_THREAD, "--mock", str(tf), "--mock-profiles", str(mp), "--db", str(db)
+            )
+            self.assertEqual(rc1, 0)
+            bot = next(a for a in out1["top_anomalies"] if a["author"] == "cron_bot")
+            self.assertIn("stage2_robotic_cadence", bot["flags"])
+            self.assertIn("stage2_cron_cadence", bot["flags"])
+            self.assertGreaterEqual(bot["sub_scores"]["class1_takeover"], 44)
+
+            rc2, out2, _ = run_cli(AUDIT_THREAD, "--mock", str(tf), "--db", str(db))
+            self.assertEqual(rc2, 0)
+            bot2 = next(a for a in out2["top_anomalies"] if a["author"] == "cron_bot")
+            self.assertEqual(bot2["profile_drift"]["status"], "cached_24h")
+            self.assertIn("stage2_robotic_cadence", bot2["flags"])
+            self.assertIn("stage2_cron_cadence", bot2["flags"])
+
+        # 2. Per-host rate-limit delay: sleeps for same host, skips sleep when switching hosts
+        fetcher = core.RateLimitedFetcher("test-agent", delay_sec=0.15, use_oauth=False)
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp(b'{"ok":true}')):
+            fetcher.fetch_json("https://www.reddit.com/r/test.json")
+            t_switch0 = time.monotonic()
+            fetcher.fetch_json("https://arctic-shift.photon-reddit.com/api/posts/ids?ids=abc")
+            switch_elapsed = time.monotonic() - t_switch0
+            self.assertLess(switch_elapsed, 0.08)
+
+            t_same0 = time.monotonic()
+            fetcher.fetch_json("https://arctic-shift.photon-reddit.com/api/comments/search?link_id=t3_abc")
+            same_elapsed = time.monotonic() - t_same0
+            self.assertGreaterEqual(same_elapsed, 0.10)
 
 
 if __name__ == "__main__":

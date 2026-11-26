@@ -42,7 +42,7 @@ ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com/api"
 REQUEST_DELAY_SEC = 2.0
 HTTP_TIMEOUT_SEC = 20.0
 PROFILE_CACHE_TTL_SEC = 86400  # 24 hours
-PROFILE_COMMENTS_LIMIT = 15
+PROFILE_COMMENTS_LIMIT = 30
 DEFAULT_STAGE2_SPOT_CHECKS = 2
 
 OP_CONTENT_MAX_CHARS = 600
@@ -114,6 +114,8 @@ REFERENCE_DOMAINS = {
     "i.imgur.com",
     "ibb.co",
     "i.ibb.co",
+    "coinmarketcap.com",
+    "coingecko.com",
     "bbc.com",
     "bbc.co.uk",
     "reuters.com",
@@ -453,6 +455,39 @@ def aggregate_stylometry(texts: list[str]) -> dict[str, float]:
     }
 
 
+def compute_history_self_duplication(texts: list[str]) -> tuple[float, int, int]:
+    """Lightweight Stage-2 3-gram Jaccard self-duplication detector over historical texts."""
+    gram_sets: list[set[tuple[str, str, str]]] = []
+    for raw in texts:
+        cleaned = html.unescape(raw or "")
+        cleaned = RE_QUOTE_LINE.sub(" ", cleaned)
+        cleaned = RE_URL.sub(" ", cleaned)
+        words = [w.lower() for w in RE_WORD_TOKEN.findall(cleaned) if len(w) >= 2]
+        if len(words) >= 8:
+            gram_sets.append({(words[i], words[i + 1], words[i + 2]) for i in range(len(words) - 2)})
+
+    eligible = len(gram_sets)
+    if eligible < 3:
+        return 0.0, 0, eligible
+
+    dup_items: set[int] = set()
+    dup_pairs = 0
+    for i in range(eligible):
+        sa = gram_sets[i]
+        for j in range(i + 1, eligible):
+            sb = gram_sets[j]
+            inter = len(sa & sb)
+            if inter == 0:
+                continue
+            union = len(sa | sb)
+            if union > 0 and (inter / union) >= 0.50:
+                dup_pairs += 1
+                dup_items.add(i)
+                dup_items.add(j)
+
+    return round(len(dup_items) / eligible, 3), dup_pairs, eligible
+
+
 def _mix32(val: int, salt: int) -> int:
     """Deterministic 32-bit integer hash mixer for independent MinHash LSH bands."""
     x = (val ^ salt) & 0xFFFFFFFF
@@ -732,7 +767,7 @@ class RateLimitedFetcher:
             self.active_source = "reddit_oauth"
         else:
             self.active_source = "reddit_public"
-        self._last_request_mono: Optional[float] = None
+        self._last_request_by_host: dict[str, float] = {}
         self._access_token: Optional[str] = None
         self._token_expires_mono: float = 0.0
 
@@ -742,9 +777,10 @@ class RateLimitedFetcher:
             return "arctic_shift_public"
         return "oauth" if self.oauth_enabled else "public_json"
 
-    def _respect_delay(self) -> None:
-        if self._last_request_mono is not None:
-            elapsed = time.monotonic() - self._last_request_mono
+    def _respect_delay(self, host: str = "") -> None:
+        last = self._last_request_by_host.get(host)
+        if last is not None:
+            elapsed = time.monotonic() - last
             remaining = self.delay_sec - elapsed
             if remaining > 0:
                 time.sleep(remaining)
@@ -760,7 +796,8 @@ class RateLimitedFetcher:
         ):
             return self._access_token, None
 
-        self._respect_delay()
+        token_host = "www.reddit.com"
+        self._respect_delay(token_host)
         creds = f"{self._client_id}:{self._client_secret}".encode("utf-8")
         basic_b64 = base64.b64encode(creds).decode("ascii")
         body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("ascii")
@@ -777,10 +814,10 @@ class RateLimitedFetcher:
         )
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
-                self._last_request_mono = time.monotonic()
+                self._last_request_by_host[token_host] = time.monotonic()
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
-            self._last_request_mono = time.monotonic()
+            self._last_request_by_host[token_host] = time.monotonic()
             return None, {
                 "code": exc.code,
                 "type": "oauth_auth_failed",
@@ -791,7 +828,7 @@ class RateLimitedFetcher:
                 ),
             }
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-            self._last_request_mono = time.monotonic()
+            self._last_request_by_host[token_host] = time.monotonic()
             return None, {
                 "code": None,
                 "type": "oauth_network_error",
@@ -814,7 +851,7 @@ class RateLimitedFetcher:
     def fetch_json(
         self, url: str, _retried_401: bool = False
     ) -> tuple[Optional[Any], Optional[dict[str, Any]]]:
-        """Fetch and decode JSON from URL (applying Reddit OAuth2 only to reddit.com hosts)."""
+        """Fetch and decode JSON from URL (with Reddit OAuth2 and Arctic Shift transient retries)."""
         target_url = url
         headers = {
             "User-Agent": self.user_agent,
@@ -822,6 +859,10 @@ class RateLimitedFetcher:
         }
         parsed_host = (urllib.parse.urlparse(url).hostname or "").lower()
         is_reddit_host = parsed_host == "reddit.com" or parsed_host.endswith(".reddit.com")
+        is_arctic_host = (
+            parsed_host == "arctic-shift.photon-reddit.com"
+            or parsed_host.endswith(".photon-reddit.com")
+        )
 
         if self.oauth_enabled and is_reddit_host:
             token, tok_err = self._ensure_oauth_token(force_refresh=_retried_401)
@@ -830,72 +871,109 @@ class RateLimitedFetcher:
             target_url = rewrite_to_oauth_url(url)
             headers["Authorization"] = f"Bearer {token}"
 
-        self._respect_delay()
-        req = urllib.request.Request(target_url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
-                self._last_request_mono = time.monotonic()
-                raw_bytes = resp.read()
-                text = raw_bytes.decode("utf-8", errors="replace")
-                return json.loads(text), None
-        except urllib.error.HTTPError as exc:
-            self._last_request_mono = time.monotonic()
-            if exc.code == 401 and self.oauth_enabled and is_reddit_host and not _retried_401:
-                self._access_token = None
-                return self.fetch_json(url, _retried_401=True)
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            if exc.code == 429:
-                hint = f" Retry-After={retry_after}s." if retry_after else ""
+        target_host = (urllib.parse.urlparse(target_url).hostname or parsed_host).lower()
+        max_attempts = 3 if is_arctic_host else 1
+        for attempt in range(1, max_attempts + 1):
+            self._respect_delay(target_host)
+            req = urllib.request.Request(target_url, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+                    self._last_request_by_host[target_host] = time.monotonic()
+                    raw_bytes = resp.read()
+                    text = raw_bytes.decode("utf-8", errors="replace")
+                    return json.loads(text), None
+            except urllib.error.HTTPError as exc:
+                self._last_request_by_host[target_host] = time.monotonic()
+                if exc.code == 401 and self.oauth_enabled and is_reddit_host and not _retried_401:
+                    self._access_token = None
+                    return self.fetch_json(url, _retried_401=True)
+
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if is_arctic_host and attempt < max_attempts and exc.code in (422, 429, 500, 502, 503, 504):
+                    if self.delay_sec > 0:
+                        ra_sec = 0.0
+                        if retry_after:
+                            try:
+                                ra_sec = float(retry_after)
+                            except ValueError:
+                                ra_sec = 0.0
+                        backoff = min(10.0, max(self.delay_sec, 1.5 * attempt, min(ra_sec, 10.0)))
+                        time.sleep(backoff)
+                    continue
+
+                err_snippet = ""
+                try:
+                    raw_err = exc.read(160)
+                    if raw_err:
+                        err_snippet = neutralize_untrusted_text(
+                            raw_err.decode("utf-8", errors="replace"), 120
+                        )
+                except Exception:
+                    err_snippet = ""
+
+                if exc.code == 429:
+                    hint = f" Retry-After={retry_after}s." if retry_after else ""
+                    return None, {
+                        "code": 429,
+                        "type": "rate_limited",
+                        "message": (
+                            "Endpoint returned HTTP 429 Too Many Requests."
+                            f"{hint} Wait briefly or re-run with --no-profile-fetch."
+                        ),
+                    }
+                if exc.code == 403:
+                    if is_reddit_host and not self.oauth_enabled:
+                        msg = (
+                            "Reddit returned HTTP 403 Forbidden on the unauthenticated .json endpoint. "
+                            "Use --source auto (Arctic Shift public API fallback), configure Reddit OAuth2, "
+                            "or pass a locally saved JSON via --mock."
+                        )
+                    else:
+                        msg = (
+                            "Endpoint returned HTTP 403 Forbidden. The thread/subreddit "
+                            "may be private, quarantined, or restricting access."
+                        )
+                    return None, {
+                        "code": 403,
+                        "type": "forbidden",
+                        "message": msg,
+                    }
+                detail = f" ({err_snippet})" if err_snippet else ""
                 return None, {
-                    "code": 429,
-                    "type": "rate_limited",
-                    "message": (
-                        "Endpoint returned HTTP 429 Too Many Requests."
-                        f"{hint} Wait briefly or re-run with --no-profile-fetch."
-                    ),
+                    "code": exc.code,
+                    "type": "http_error",
+                    "message": f"HTTP {exc.code}: {exc.reason}{detail}",
                 }
-            if exc.code == 403:
-                if is_reddit_host and not self.oauth_enabled:
-                    msg = (
-                        "Reddit returned HTTP 403 Forbidden on the unauthenticated .json endpoint. "
-                        "Use --source auto (Arctic Shift public API fallback), configure Reddit OAuth2, "
-                        "or pass a locally saved JSON via --mock."
-                    )
-                else:
-                    msg = (
-                        "Endpoint returned HTTP 403 Forbidden. The thread/subreddit "
-                        "may be private, quarantined, or restricting access."
-                    )
+            except urllib.error.URLError as exc:
+                self._last_request_by_host[target_host] = time.monotonic()
                 return None, {
-                    "code": 403,
-                    "type": "forbidden",
-                    "message": msg,
+                    "code": None,
+                    "type": "network_error",
+                    "message": f"Network error reaching endpoint: {exc.reason}",
                 }
-            return None, {
-                "code": exc.code,
-                "type": "http_error",
-                "message": f"HTTP {exc.code}: {exc.reason}",
-            }
-        except urllib.error.URLError as exc:
-            self._last_request_mono = time.monotonic()
-            return None, {
-                "code": None,
-                "type": "network_error",
-                "message": f"Network error reaching endpoint: {exc.reason}",
-            }
-        except TimeoutError:
-            self._last_request_mono = time.monotonic()
-            return None, {
-                "code": None,
-                "type": "timeout",
-                "message": f"Request timed out after {HTTP_TIMEOUT_SEC:.0f}s.",
-            }
-        except json.JSONDecodeError as exc:
-            return None, {
-                "code": None,
-                "type": "invalid_json",
-                "message": f"Failed to parse JSON response: {exc}",
-            }
+            except TimeoutError:
+                self._last_request_by_host[target_host] = time.monotonic()
+                if is_arctic_host and attempt < max_attempts:
+                    if self.delay_sec > 0:
+                        time.sleep(min(10.0, max(self.delay_sec, 1.5 * attempt)))
+                    continue
+                return None, {
+                    "code": None,
+                    "type": "timeout",
+                    "message": f"Request timed out after {HTTP_TIMEOUT_SEC:.0f}s.",
+                }
+            except json.JSONDecodeError as exc:
+                return None, {
+                    "code": None,
+                    "type": "invalid_json",
+                    "message": f"Failed to parse JSON response: {exc}",
+                }
+
+        return None, {
+            "code": None,
+            "type": "http_error",
+            "message": "Endpoint request failed after retries.",
+        }
 
     # -- High-level fetchers with seamless 403 -> Arctic Shift fallback ------
 
@@ -938,13 +1016,37 @@ class RateLimitedFetcher:
         )
         c_data, c_err = self.fetch_json(c_url)
         comments_list: list[dict[str, Any]] = []
+        tree_nodes: Optional[list[dict[str, Any]]] = None
+        if c_err is not None and c_err.get("code") == 422:
+            t_url = (
+                f"{ARCTIC_SHIFT_BASE}/comments/tree?"
+                f"{urllib.parse.urlencode({'link_id': f't3_{thread_id}', 'limit': lim})}"
+            )
+            t_data, t_err = self.fetch_json(t_url)
+            if t_err is None and isinstance(t_data, dict) and isinstance(t_data.get("data"), list):
+                tree_nodes = [
+                    n for n in t_data["data"] if isinstance(n, dict) and n.get("kind") == "t1"
+                ]
+                c_err = None
+
+        if tree_nodes is not None:
+            tid = str(post.get("id") or thread_id)
+            post_wrapped = dict(post)
+            if tid and not post_wrapped.get("name"):
+                post_wrapped["name"] = f"t3_{tid}"
+            payload = [
+                {"kind": "Listing", "data": {"children": [{"kind": "t3", "data": post_wrapped}]}},
+                {"kind": "Listing", "data": {"children": tree_nodes}},
+            ]
+            return payload, None, notes
+
         if c_err is not None:
             notes.append(f"Arctic Shift comments fetch error: {c_err['message']}")
         elif isinstance(c_data, dict):
             comments_list = c_data.get("data") or []
 
         expected_comments = int(post.get("num_comments") or 0)
-        if expected_comments > 0 and len(comments_list) == 0:
+        if c_err is None and expected_comments > 0 and len(comments_list) == 0:
             notes.append(
                 f"Arctic Shift archive lag: thread reports {expected_comments} comments on Reddit "
                 "but 0 are indexed yet (very recent threads typically appear within 1-4 hours)."
@@ -1352,6 +1454,15 @@ class RedditGraphDB:
                 band_3 TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS author_domains (
+                author TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                subreddit TEXT NOT NULL,
+                created_utc REAL NOT NULL,
+                PRIMARY KEY (author, domain, thread_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_threads_subreddit ON threads(subreddit);
             CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
             CREATE INDEX IF NOT EXISTS idx_comments_author ON comments(author);
@@ -1364,6 +1475,7 @@ class RedditGraphDB:
             CREATE INDEX IF NOT EXISTS idx_shingles_band2 ON comment_shingles(band_2);
             CREATE INDEX IF NOT EXISTS idx_shingles_band3 ON comment_shingles(band_3);
             CREATE INDEX IF NOT EXISTS idx_shingles_author ON comment_shingles(author);
+            CREATE INDEX IF NOT EXISTS idx_author_domains_author ON author_domains(author, domain);
             """
         )
         # Forward-compatible column migrations for existing DBs
@@ -1473,6 +1585,78 @@ class RedditGraphDB:
             rows,
         )
         self.conn.commit()
+
+    def upsert_author_domains(
+        self, op_info: dict[str, Any], comments: list[dict[str, Any]]
+    ) -> None:
+        """Persist unique (author, non_ref_domain, thread_id) records for solo shill tracking."""
+        seen: set[tuple[str, str, str]] = set()
+        rows: list[tuple[str, str, str, str, float]] = []
+        sub = op_info["subreddit"]
+        tid = op_info["thread_id"]
+
+        if not op_info.get("author_ignored"):
+            for d in op_info.get("domains") or []:
+                if not is_reference_domain(d):
+                    k = (op_info["author"], d, tid)
+                    if k not in seen:
+                        seen.add(k)
+                        rows.append((op_info["author"], d, tid, sub, float(op_info["created_utc"])))
+
+        for c in comments:
+            for d in c.get("domains") or []:
+                if not is_reference_domain(d):
+                    k = (c["author"], d, c["thread_id"])
+                    if k not in seen:
+                        seen.add(k)
+                        rows.append((c["author"], d, c["thread_id"], sub, float(c["created_utc"])))
+
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO author_domains (author, domain, thread_id, subreddit, created_utc)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(author, domain, thread_id) DO NOTHING
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def query_repeat_domain_promoters(self, authors: set[str]) -> list[dict[str, Any]]:
+        """Find authors posting the same non-reference domain across >=2 distinct threads."""
+        if not authors:
+            return []
+        lower_to_orig = {a.lower(): a for a in authors}
+        placeholders = ",".join("?" for _ in lower_to_orig)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                LOWER(author) AS author_low,
+                domain,
+                COUNT(DISTINCT thread_id) AS distinct_threads,
+                GROUP_CONCAT(DISTINCT subreddit) AS subs
+            FROM author_domains
+            WHERE LOWER(author) IN ({placeholders})
+            GROUP BY LOWER(author), domain
+            HAVING COUNT(DISTINCT thread_id) >= 2
+            ORDER BY distinct_threads DESC, author_low ASC, domain ASC
+            """,
+            list(lower_to_orig.keys()),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            orig = lower_to_orig.get(r["author_low"], r["author_low"])
+            subs = sorted({s.strip() for s in (r["subs"] or "").split(",") if s.strip()})
+            out.append(
+                {
+                    "author": orig,
+                    "domain": r["domain"],
+                    "distinct_threads": int(r["distinct_threads"]),
+                    "subreddits": subs[:5],
+                }
+            )
+        return out
 
     def upsert_comment_shingles(self, items: list[dict[str, Any]]) -> None:
         """Persist 4-band LSH shingle sketches for comments and eligible OP posts."""
@@ -1952,12 +2136,14 @@ class RedditGraphDB:
         wl = self.get_watchlist_map({author}).get(author)
         wl_assoc = self.query_watchlisted_co_occurrences({author}, window_sec=300.0).get(author, [])
         dup_peers = self.query_author_shingle_peers(author)
+        repeat_domains = self.query_repeat_domain_promoters({author})[:5]
         return {
             "threads_in_db": threads_seen,
             "comments_in_db": int(comment_stats["cnt"] or 0),
             "max_recorded_score": round(float(comment_stats["max_score"] or 0.0), 1),
             "top_co_occurring_peers": top_peers,
             "cross_account_duplicate_peers": dup_peers,
+            "repeat_promoted_domains": repeat_domains,
             "watchlist_entry": wl,
             "watchlisted_associations": wl_assoc,
         }
@@ -2365,10 +2551,10 @@ def score_op_class3(op_info: dict[str, Any]) -> tuple[int, list[str]]:
 
     non_ref_domains = [d for d in op_info["domains"] if not is_reference_domain(d)]
     selftext_len = len(op_info["raw_selftext"])
-    if op_info["is_self"] and selftext_len >= 300 and non_ref_domains and RE_OP_PROMO_PITCH.search(combined):
+    if selftext_len >= 300 and non_ref_domains and RE_OP_PROMO_PITCH.search(combined):
         score += 18
         flags.append("op_promotional_pitch")
-    if op_info["is_self"] and selftext_len >= 600 and len(non_ref_domains) >= 2:
+    if selftext_len >= 600 and len(non_ref_domains) >= 2:
         score += 14
         flags.append("op_multi_domain_self_promo")
 
@@ -2505,6 +2691,7 @@ def evaluate_coordination_graph(
         if shingle_items
         else []
     )
+    repeat_promoters = db.query_repeat_domain_promoters(current_authors)
 
     current_edge_by_pair: dict[tuple[str, str], dict[str, Any]] = {
         (e["author_a"], e["author_b"]): e for e in current_edges
@@ -2710,6 +2897,16 @@ def evaluate_coordination_graph(
             }
         )
 
+    # Single-author cross-thread non-reference domain promotion (catches solo shills)
+    for rp in repeat_promoters:
+        author = rp["author"]
+        wl_u = watchlist_map.get(author)
+        if wl_u and wl_u["verdict"].lower() == "benign":
+            continue
+        pts = 48.0 if rp["distinct_threads"] >= 3 else 26.0
+        author_scores[author] = max(author_scores[author], pts)
+        author_flags[author].add("repeat_domain_promoter")
+
     # Zero out Class 2 swarm scores for explicitly verified benign accounts
     for author, wl in watchlist_map.items():
         if wl["verdict"].lower() == "benign":
@@ -2788,6 +2985,7 @@ def evaluate_coordination_graph(
         "watchlist_hits": watchlist_hits,
         "watchlist_associations": watchlist_assoc_out[:10],
         "near_duplicate_links": near_duplicate_links[:6],
+        "repeat_domain_promoters": repeat_promoters[:8],
     }
     return final_scores, final_flags, clusters, graph_meta
 
@@ -2821,6 +3019,9 @@ def parse_user_comments_history(
                 "char_len": len(body),
                 "created_utc": created_utc,
                 "author_created_utc": d.get("author_created_utc"),
+                "non_ref_domains": [
+                    dom for dom in extract_urls_and_domains(body)[1] if not is_reference_domain(dom)
+                ],
             }
         )
     return history
@@ -2853,7 +3054,55 @@ def compute_baseline_from_history(
     hour_counts: dict[int, int] = collections.Counter(
         utc_hour_from_ts(ts) for ts in timestamps
     )
-    stylometry = aggregate_stylometry([str(h.get("body") or "") for h in history])
+    texts = [str(h.get("body") or "") for h in history]
+    stylometry = aggregate_stylometry(texts)
+
+    dup_ratio, dup_pairs, dup_eligible = compute_history_self_duplication(texts)
+    dom_counter: collections.Counter[str] = collections.Counter()
+    linked_comments = 0
+    for h in history:
+        doms = h.get("non_ref_domains")
+        if doms is None:
+            doms = [
+                dom
+                for dom in extract_urls_and_domains(str(h.get("body") or ""))[1]
+                if not is_reference_domain(dom)
+            ]
+        if doms:
+            linked_comments += 1
+            for dom in set(doms):
+                dom_counter[dom] += 1
+    top_dom_count = dom_counter.most_common(1)[0][1] if dom_counter else 0
+    top_dom_share = round(top_dom_count / linked_comments, 3) if linked_comments else 0.0
+    session_intervals = [iv for iv in intervals if 60.0 <= iv <= 7200.0]
+    hist_interval_cv = -1.0
+    if len(session_intervals) >= 6:
+        mean_iv = statistics.mean(session_intervals)
+        if mean_iv > 0:
+            hist_interval_cv = round(statistics.pstdev(session_intervals) / mean_iv, 3)
+    hist_cron_ratio = (
+        round(
+            sum(1 for ts in timestamps if min(ts % 900.0, 900.0 - (ts % 900.0)) <= 15.0)
+            / len(timestamps),
+            3,
+        )
+        if len(timestamps) >= 10
+        else 0.0
+    )
+    stylometry.update(
+        {
+            "self_dup_ratio": dup_ratio,
+            "self_dup_pairs": float(dup_pairs),
+            "self_dup_eligible": float(dup_eligible),
+            "hist_linked_comments": float(linked_comments),
+            "hist_top_domain_count": float(top_dom_count),
+            "hist_top_domain_share": top_dom_share,
+            "hist_interval_cv": float(hist_interval_cv),
+            "hist_session_intervals": float(len(session_intervals)),
+            "hist_cron_ratio": float(hist_cron_ratio),
+            "hist_ts_count": float(len(timestamps)),
+        }
+    )
 
     account_age_days: Optional[float] = None
     for h in history:
@@ -2936,6 +3185,37 @@ def score_profile_drift(
         "stylometric_formality_jump" in drift_flags
         or "stylometric_punctuation_shift" in drift_flags
     )
+
+    # 2b. Stage-2 behavioral checks over expanded 30-comment baseline (copy-paste loops & domain shill concentration)
+    if hist_style:
+        if hist_style.get("self_dup_eligible", 0.0) >= 4.0 and (
+            (hist_style.get("self_dup_ratio", 0.0) >= 0.35 and hist_style.get("self_dup_pairs", 0.0) >= 2.0)
+            or hist_style.get("self_dup_pairs", 0.0) >= 4.0
+        ):
+            score += 28
+            drift_flags.append("stage2_self_duplication_loop")
+
+        if (
+            hist_style.get("hist_linked_comments", 0.0) >= 4.0
+            and hist_style.get("hist_top_domain_count", 0.0) >= 3.0
+            and hist_style.get("hist_top_domain_share", 0.0) >= 0.65
+        ):
+            score += 24
+            drift_flags.append("stage2_domain_concentration")
+
+        if (
+            hist_style.get("hist_session_intervals", 0.0) >= 6.0
+            and 0.0 <= hist_style.get("hist_interval_cv", -1.0) <= 0.15
+        ):
+            score += 24
+            drift_flags.append("stage2_robotic_cadence")
+
+        if (
+            hist_style.get("hist_ts_count", 0.0) >= 10.0
+            and hist_style.get("hist_cron_ratio", 0.0) >= 0.60
+        ):
+            score += 20
+            drift_flags.append("stage2_cron_cadence")
 
     len_ratio: Optional[float] = None
     if sample_size < 3:
@@ -3465,6 +3745,7 @@ def audit_thread_payload(
         op_info, comments, window_sec=window_sec
     )
     db.upsert_co_occurrences(current_edges)
+    db.upsert_author_domains(op_info, comments)
 
     # Compute and persist 4-band MinHash shingle sketches for OP + comments
     shingle_items: list[dict[str, Any]] = []
@@ -3707,6 +3988,7 @@ def audit_thread_payload(
         "watchlist_hits": graph_meta["watchlist_hits"],
         "watchlist_associations": graph_meta["watchlist_associations"],
         "near_duplicate_links": graph_meta["near_duplicate_links"],
+        "repeat_domain_promoters": graph_meta["repeat_domain_promoters"],
         "warnings": warnings,
     }
 
